@@ -28,13 +28,29 @@ class RetrievalTrace(BaseModel):
     total_latency_ms: float = 0.0
     metadata: dict[str, Any] = Field(default_factory=dict)
     
+    # Per-source candidate lists, each capped at candidate_k so every method is
+    # measured at the same retrieval depth (the review's #1 fairness fix).
     bm25_candidates: list[str] = Field(default_factory=list)
     vector_candidates: list[str] = Field(default_factory=list)
     graph_candidates: list[str] = Field(default_factory=list)
     community_candidates: list[str] = Field(default_factory=list)
+    # Unranked union of every candidate the pipeline saw (answers "is the
+    # evidence anywhere in the pool?" — candidate_pool_recall).
+    candidate_pool: list[str] = Field(default_factory=list)
+    # Ranked union after fusion (answers candidate_ranked_recall). Kept under the
+    # legacy name ``union_candidates`` for back-compat with old artifacts.
     union_candidates: list[str] = Field(default_factory=list)
+    # Stage-by-stage ranked snapshots of raw episodes, enabling per-stage loss
+    # attribution (fusion → graph → temporal → provenance → final).
+    post_fusion_ranking: list[str] = Field(default_factory=list)
+    pre_graph: list[str] = Field(default_factory=list)
+    post_graph: list[str] = Field(default_factory=list)
+    post_temporal: list[str] = Field(default_factory=list)
+    post_provenance: list[str] = Field(default_factory=list)
     pre_rerank: list[str] = Field(default_factory=list)
     post_rerank: list[str] = Field(default_factory=list)
+    final_ranking: list[str] = Field(default_factory=list)
+    candidate_k: int = 0
     ground_truth_ranks: dict[str, int] = Field(default_factory=dict)
 
 
@@ -80,5 +96,11 @@ class Retriever(Protocol):
     name: str
 
     def build(self, corpus: list[dict], config: Any) -> IndexStats: ...
-    def query(self, query: str, top_k: int = 10, trace: bool = False) -> RetrievalResult: ...
+    def query(
+        self,
+        query: str,
+        top_k: int = 10,
+        trace: bool = False,
+        candidate_k: int = 100,
+    ) -> RetrievalResult: ...
     def close(self) -> None: ...

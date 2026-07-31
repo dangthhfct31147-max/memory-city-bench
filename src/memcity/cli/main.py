@@ -379,19 +379,24 @@ def benchmark_e2e(
     data_dir: str = typer.Option("data", "--data-dir"),
     output_dir: str = typer.Option("runs", "--output"),
 ) -> None:
-    """Run end-to-end (retriever → reader LLM) benchmark. Reader is optional."""
+    """Run end-to-end (retriever → reader LLM) benchmark with scope isolation.
+
+    Retrieval is scope-isolated: one index is built per corpus scope (one per
+    LoCoMo conversation, one per LongMemEval haystack) — identical to the
+    retrieval benchmark. The oracle also looks up evidence from the correct
+    scope so cross-scope contamination is zero by construction.
+    """
+    from memcity.datasets.corpus import build_scope_corpus, group_samples_by_scope
     from memcity.datasets.loader import load_dataset
     from memcity.evaluation.e2e_metrics import compute_e2e_metrics
     from memcity.instrumentation.resources import collect_environment, get_vram_mb
     from memcity.readers.reader import OpenAICompatibleReader, OracleReader
-    from memcity.retrieval.registry import get_retriever
+    from memcity.retrieval.registry import get_retriever_factory
     from memcity.utils.helpers import run_id as make_run_id
     from memcity.utils.helpers import write_jsonl
 
     _, samples = load_dataset(dataset, data_dir, seed=seed, limit=limit)
 
-    corpus = _samples_to_corpus(samples)
-    corpus_map = {c["id"]: c for c in corpus}
     retriever_list = [r.strip() for r in retrievers.split(",")]
 
     if reader_provider in ("oracle", "none"):
@@ -413,49 +418,87 @@ def benchmark_e2e(
         console.print(f"[red]Unknown reader provider: {reader_provider}[/red]")
         raise typer.Exit(1)
 
+    # Pre-build scope data structures once (shared across retriever variants).
+    scope_corpora = build_scope_corpus(samples)
+    scoped_samples = group_samples_by_scope(samples)
+    # Flat lookup for oracle evidence (scoped: episode id → corpus item per scope).
+    scope_corpus_maps: dict[str, dict[str, dict]] = {
+        scope_id: {c["id"]: c for c in corpus}
+        for scope_id, corpus in scope_corpora.items()
+    }
+    # Map each sample_id to its scope for fast lookup during evaluation.
+    sample_to_scope: dict[str, str] = {
+        sample.sample_id: scope_id
+        for scope_id, scope_samples_list in scoped_samples.items()
+        for sample in scope_samples_list
+    }
+
     all_tables: list[dict] = []
     for method in retriever_list:
+        console.print(f"\n[bold cyan]E2E: {method} -> {reader_provider}...[/bold cyan]")
+
+        retriever_factory = get_retriever_factory(method)
+        reader_results: list[dict] = []
+        vram_samples_list: list[float] = []
+
         try:
-            retriever = get_retriever(method)
-            retriever.build(corpus)
+            # Build one scope-isolated index per scope (mirror of retrieval runner).
+            scope_retrievers: dict[str, object] = {}
+            for scope_id, corpus in scope_corpora.items():
+                r = retriever_factory()
+                r.build(corpus)
+                scope_retrievers[scope_id] = r
+
+            for sample in samples:
+                scope_id = sample_to_scope.get(sample.sample_id, "")
+                scope_retriever = scope_retrievers.get(scope_id)
+                scope_corpus_map = scope_corpus_maps.get(scope_id, {})
+
+                if method == "oracle":
+                    evidence = [
+                        scope_corpus_map[evidence_id]
+                        for evidence_id in sample.evidence_episode_ids
+                        if evidence_id in scope_corpus_map
+                    ]
+                elif scope_retriever is not None:
+                    result = scope_retriever.query(sample.query, top_k=top_k)
+                    evidence = [
+                        scope_corpus_map[item.id]
+                        for item in result.items
+                        if item.id in scope_corpus_map
+                    ]
+                else:
+                    evidence = []
+
+                if use_oracle:
+                    ev_ids = sample.evidence_episode_ids
+                    oracle_ev = [scope_corpus_map[e] for e in ev_ids if e in scope_corpus_map]
+                    rr = reader.answer(
+                        sample_id=sample.sample_id,
+                        query=sample.query,
+                        evidence=oracle_ev or evidence,
+                        retriever_name=method,
+                        ground_truth_answer=sample.answer,
+                        evidence_ids=ev_ids,
+                    )
+                else:
+                    rr = reader.answer(
+                        sample_id=sample.sample_id,
+                        query=sample.query,
+                        evidence=evidence,
+                        retriever_name=method,
+                    )
+                reader_results.append(rr.model_dump())
+                vram_samples_list.append(get_vram_mb())
+
+            for r in scope_retrievers.values():
+                r.close()
+
         except Exception as exc:
             console.print(f"[red]Skipping {method}: {exc}[/red]")
+            import traceback
+            traceback.print_exc()
             continue
-
-        reader_results: list[dict] = []
-        vram_samples: list[float] = []
-        console.print(f"\n[bold cyan]E2E: {method} -> {reader_provider}...[/bold cyan]")
-        for sample in samples:
-            if method == "oracle":
-                evidence = [
-                    corpus_map[evidence_id]
-                    for evidence_id in sample.evidence_episode_ids
-                    if evidence_id in corpus_map
-                ]
-            else:
-                result = retriever.query(sample.query, top_k=top_k)
-                evidence = [corpus_map[item.id] for item in result.items if item.id in corpus_map]
-            if use_oracle:
-                ev_ids = sample.evidence_episode_ids
-                oracle_ev = [corpus_map[e] for e in ev_ids if e in corpus_map]
-                rr = reader.answer(
-                    sample_id=sample.sample_id,
-                    query=sample.query,
-                    evidence=oracle_ev or evidence,
-                    retriever_name=method,
-                    ground_truth_answer=sample.answer,
-                    evidence_ids=ev_ids,
-                )
-            else:
-                rr = reader.answer(
-                    sample_id=sample.sample_id,
-                    query=sample.query,
-                    evidence=evidence,
-                    retriever_name=method,
-                )
-            reader_results.append(rr.model_dump())
-            vram_samples.append(get_vram_mb())
-        retriever.close()
 
         metrics = compute_e2e_metrics(reader_results, samples)
         metrics["retriever"] = method
@@ -464,7 +507,7 @@ def benchmark_e2e(
         metrics["reader_model"] = reader_model if not use_oracle else "oracle"
         metrics["context_token_budget"] = context_token_budget
         metrics["top_k"] = top_k
-        metrics["peak_vram_mb"] = max(vram_samples) if vram_samples else 0.0
+        metrics["peak_vram_mb"] = max(vram_samples_list) if vram_samples_list else 0.0
         all_tables.append(metrics)
 
         rid = make_run_id()
@@ -486,6 +529,7 @@ def benchmark_e2e(
                     "top_k": top_k,
                     "limit": limit,
                     "seed": seed,
+                    "scope_count": len(scope_corpora),
                 },
                 indent=2,
             ),

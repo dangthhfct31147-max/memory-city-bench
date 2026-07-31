@@ -116,6 +116,7 @@ class MemoryCityRetriever:
             store=self._store,
             semantic_threshold=self._sem_thresh,
             num_topic_hubs=self._n_hubs,
+            enable_be=self._enable_be,
         )
         self._graph = builder.build(corpus)
 
@@ -134,11 +135,18 @@ class MemoryCityRetriever:
             build_wall_time_s=time.perf_counter() - t0,
         )
 
-    def query(self, query: str, top_k: int = 10, trace: bool = False) -> RetrievalResult:
+    def query(
+        self,
+        query: str,
+        top_k: int = 10,
+        trace: bool = False,
+        candidate_k: int = 100,
+    ) -> RetrievalResult:
         t0 = time.perf_counter()
         stage_latency: dict[str, float] = {}
-        # Keep a deep candidate pool so candidate_recall diagnostics are meaningful.
-        candidates = max(top_k * 4, 100)
+        # Use caller-supplied candidate_k so every retriever is evaluated at the
+        # same depth (review issue #1: candidate recall fairness).
+        candidates = max(top_k, candidate_k)
 
         # ── Coordinator routing ───────────────────────────────────────────────
         if self._coord_enabled:
@@ -152,6 +160,18 @@ class MemoryCityRetriever:
             )
 
         low_confidence = decision.confidence < _CONFIDENCE_FALLBACK
+
+        # _route_active: a component should fire when its enable flag is on AND
+        # either (a) the coordinator is off (pure ablation, fire unconditionally)
+        # or (b) the coordinator is on, confidence is adequate, and the correct
+        # route was selected.  This decouples ablation flags from coordinator
+        # routing so each variant tests exactly what its name says.
+        def _route_active(flag: bool, route: Route) -> bool:
+            if not flag:
+                return False
+            if not self._coord_enabled:
+                return True
+            return not low_confidence and route in decision.routes
 
         # ── Component retrieval ───────────────────────────────────────────────
         t1 = time.perf_counter()
@@ -167,12 +187,7 @@ class MemoryCityRetriever:
             vec_ids = [it.id for it in vec_res.items]
 
         community_ids: list[str] = []
-        if (
-            self._enable_community
-            and not low_confidence
-            and Route.COMMUNITY_GLOBAL in decision.routes
-            and self._graph
-        ):
+        if _route_active(self._enable_community, Route.COMMUNITY_GLOBAL) and self._graph:
             t1 = time.perf_counter()
             community_ids = self._community_search(query, candidates)
             stage_latency["community"] = (time.perf_counter() - t1) * 1000
@@ -181,26 +196,22 @@ class MemoryCityRetriever:
         weights = decision.weights if not low_confidence else {"lexical": 0.5, "vector": 0.5}
         w_lex = weights.get("lexical", 0.5)
         w_vec = weights.get("vector", 0.5)
-        w_com = weights.get("community", 0.5)
+        w_com = weights.get("community", 0.5) if community_ids else 0.0
         t1 = time.perf_counter()
         base_scores = self._weighted_rrf(
             [(bm25_ids, w_lex), (vec_ids, w_vec), (community_ids, w_com)]
         )
         stage_latency["fusion"] = (time.perf_counter() - t1) * 1000
 
-        # Snapshot: fused ranking of raw episodes before any graph/temporal stage.
-        pre_rerank = self._rank_episode_ids(base_scores)
+        # Snapshot after fusion, before any graph stage (pre_graph = post_fusion).
+        post_fusion_ranking = self._rank_episode_ids(base_scores)
+        pre_graph = post_fusion_ranking
 
         scores = dict(base_scores)
 
         # ── Graph expansion (supplement only) ─────────────────────────────────
         graph_ids: list[str] = []
-        if (
-            self._enable_graph_expansion
-            and not low_confidence
-            and Route.LOCAL_GRAPH in decision.routes
-            and self._graph
-        ):
+        if _route_active(self._enable_graph_expansion, Route.LOCAL_GRAPH) and self._graph:
             t1 = time.perf_counter()
             seeds = [d for d, _ in sorted(base_scores.items(), key=lambda x: x[1], reverse=True)][:top_k]
             graph_ids = self._graph_expand(seeds, max_extra=candidates)
@@ -212,20 +223,19 @@ class MemoryCityRetriever:
                 scores[eid] = (min_base * _GRAPH_SUPPLEMENT_SCALE) / (1 + rank)
             stage_latency["graph_expand"] = (time.perf_counter() - t1) * 1000
 
-        pre_temporal = self._rank_episode_ids(scores)
+        # Snapshot after graph expansion (post_graph = pre_temporal).
+        post_graph = self._rank_episode_ids(scores)
+        pre_temporal = post_graph
 
         # ── Temporal nudge (additive, never a hard re-sort) ───────────────────
-        if (
-            self._enable_temporal
-            and not low_confidence
-            and Route.TEMPORAL in decision.routes
-        ):
+        if _route_active(self._enable_temporal, Route.TEMPORAL):
             t1 = time.perf_counter()
             scores = self._temporal_nudge(scores, query)
             stage_latency["temporal"] = (time.perf_counter() - t1) * 1000
         post_temporal = self._rank_episode_ids(scores)
 
-        # ── Provenance nudge (additive) ───────────────────────────────────────
+        # ── Provenance nudge (additive, connectivity-weighted) ────────────────
+        # Gated only by enable flag and confidence (no dedicated route).
         pre_provenance = post_temporal
         if self._enable_provenance and not low_confidence:
             t1 = time.perf_counter()
@@ -255,7 +265,12 @@ class MemoryCityRetriever:
 
         retrieval_trace: RetrievalTrace | None = None
         if trace:
+            # Ranked union of all raw-episode candidates (candidate_ranked_recall).
             union = self._rank_episode_ids(scores)
+            # Unordered pool for candidate_pool_recall.
+            pool_set = set(bm25_ids) | set(vec_ids) | set(graph_ids) | set(community_ids)
+            pool_list = list(pool_set)
+            final_ids = [it.id for it in items]
             retrieval_trace = RetrievalTrace(
                 query=query,
                 routes=[r.value for r in decision.routes],
@@ -269,9 +284,17 @@ class MemoryCityRetriever:
                 vector_candidates=vec_ids,
                 graph_candidates=graph_ids,
                 community_candidates=community_ids,
+                candidate_pool=pool_list,
                 union_candidates=union,
-                pre_rerank=pre_rerank,
-                post_rerank=[it.id for it in items],
+                post_fusion_ranking=post_fusion_ranking,
+                pre_graph=pre_graph,
+                post_graph=post_graph,
+                post_temporal=post_temporal,
+                post_provenance=post_provenance,
+                pre_rerank=post_fusion_ranking,
+                post_rerank=final_ids,
+                final_ranking=final_ids,
+                candidate_k=candidate_k,
                 metadata={
                     "confidence": decision.confidence,
                     "low_confidence_fallback": low_confidence,
@@ -390,21 +413,34 @@ class MemoryCityRetriever:
         return nudged
 
     def _provenance_nudge(self, scores: dict[str, float]) -> dict[str, float]:
-        """Add a bonus proportional to *extra* provenance beyond a single episode.
+        """Boost episodes supported by multiple independent graph paths.
 
-        A plain episode with one source contributes zero here (the old code gave
-        every candidate the same boost, which just preserved order). Only nodes
-        that genuinely aggregate multiple source episodes get lifted.
+        The nudge is proportional to the number of distinct in-neighbour episode
+        nodes in the graph — i.e. how many other episodes corroborate this one
+        through entity/semantic/community edges. This is a better proxy for
+        provenance strength than the raw source_episode_ids count (which is always
+        1 for a plain raw episode).
+
+        The nudge is bounded to ``_TEMPORAL_NUDGE * max_score`` so it can break
+        ties and reorder near-equal candidates without overturning a decisive
+        lexical/vector hit (same additive contract as the temporal nudge).
         """
         if not self._graph or not scores:
             return scores
+        max_score = max(scores.values()) or 1.0
         nudged = dict(scores)
         for nid in scores:
             if not self._graph.has_node(nid):
                 continue
-            extra = len(self._graph.nodes[nid].get("source_episode_ids", [])) - 1
-            if extra > 0:
-                nudged[nid] += extra * self._prov_boost
+            # Count distinct episode predecessors (independent corroborating paths)
+            episode_predecessors = sum(
+                1 for pred in self._graph.predecessors(nid)
+                if self._graph.nodes[pred].get("node_type") == "episode"
+            )
+            if episode_predecessors > 0:
+                # Bounded boost: at most _TEMPORAL_NUDGE * max_score regardless of path count
+                boost = self._prov_boost * min(episode_predecessors, 5) * max_score
+                nudged[nid] += boost
         return nudged
 
     def close(self) -> None:

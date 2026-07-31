@@ -22,7 +22,13 @@ _CATEGORY_MAP = {
     1: QuestionCategory.DIRECT_FACT,
     2: QuestionCategory.TEMPORAL,
     3: QuestionCategory.MULTI_HOP,
-    4: QuestionCategory.PROCEDURAL,
+    # Category 4: the official LoCoMo paper does not publish a definitive
+    # number-to-name mapping. Using a neutral label avoids false semantic claims.
+    # Track the original number in sample.metadata["category_number"].
+    4: QuestionCategory.LOCOMO_CATEGORY_4,
+    # Category 5: adversarial / unanswerable questions — the expected answer is
+    # "I don't know". Mapped to ABSTENTION so the runner excludes these from the
+    # retrieval recall denominator (no evidence to retrieve).
     5: QuestionCategory.ABSTENTION,
 }
 

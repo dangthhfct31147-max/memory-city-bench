@@ -64,7 +64,9 @@ class RandomRetriever:
             build_wall_time_s=time.perf_counter() - t0,
         )
 
-    def query(self, query: str, top_k: int = 10, trace: bool = False) -> RetrievalResult:
+    def query(
+        self, query: str, top_k: int = 10, trace: bool = False, candidate_k: int = 100
+    ) -> RetrievalResult:
         import random
         rng = random.Random(self._seed ^ hash(query))
         t0 = time.perf_counter()
@@ -96,13 +98,24 @@ class RecencyRetriever:
             build_wall_time_s=time.perf_counter() - t0,
         )
 
-    def query(self, query: str, top_k: int = 10, trace: bool = False) -> RetrievalResult:
+    def query(
+        self, query: str, top_k: int = 10, trace: bool = False, candidate_k: int = 100
+    ) -> RetrievalResult:
         t0 = time.perf_counter()
         items = [_make_retrieved(it, float(len(self._corpus) - i))
                  for i, it in enumerate(self._corpus[:top_k])]
+        retrieval_trace: RetrievalTrace | None = None
+        if trace:
+            ranked = [it["id"] for it in self._corpus[:candidate_k]]
+            retrieval_trace = RetrievalTrace(
+                query=query,
+                union_candidates=ranked,
+                pre_rerank=ranked,
+                post_rerank=[it.id for it in items],
+            )
         return RetrievalResult(
             query=query, items=items, top_k=top_k,
-            latency_ms=(time.perf_counter() - t0) * 1000,
+            latency_ms=(time.perf_counter() - t0) * 1000, trace=retrieval_trace,
         )
 
     def close(self) -> None:
@@ -131,15 +144,34 @@ class BM25Retriever:
             build_wall_time_s=time.perf_counter() - t0,
         )
 
-    def query(self, query: str, top_k: int = 10, trace: bool = False) -> RetrievalResult:
+    def query(
+        self, query: str, top_k: int = 10, trace: bool = False, candidate_k: int = 100
+    ) -> RetrievalResult:
         t0 = time.perf_counter()
         tokens = tokenize(query)
         scores = self._bm25.get_scores(tokens)
-        top_idx = np.argsort(scores)[::-1][:top_k]
-        items = [_make_retrieved(self._corpus[i], float(scores[i])) for i in top_idx]
+        # Retrieve candidate_k for trace; final result is top_k
+        cand_size = max(top_k, candidate_k)
+        cand_idx = np.argsort(scores)[::-1][:cand_size]
+        final_idx = cand_idx[:top_k]
+        items = [_make_retrieved(self._corpus[i], float(scores[i])) for i in final_idx]
+        retrieval_trace: RetrievalTrace | None = None
+        if trace:
+            cand_ids = [self._corpus[i]["id"] for i in cand_idx]
+            final_ids = [it.id for it in items]
+            retrieval_trace = RetrievalTrace(
+                query=query,
+                bm25_candidates=cand_ids,
+                candidate_pool=cand_ids,
+                union_candidates=cand_ids,
+                pre_rerank=cand_ids,
+                post_rerank=final_ids,
+                final_ranking=final_ids,
+                candidate_k=candidate_k,
+            )
         return RetrievalResult(
             query=query, items=items, top_k=top_k,
-            latency_ms=(time.perf_counter() - t0) * 1000,
+            latency_ms=(time.perf_counter() - t0) * 1000, trace=retrieval_trace,
         )
 
     def close(self) -> None:
@@ -183,15 +215,33 @@ class VectorRetriever:
             build_wall_time_s=time.perf_counter() - t0,
         )
 
-    def query(self, query: str, top_k: int = 10, trace: bool = False) -> RetrievalResult:
+    def query(
+        self, query: str, top_k: int = 10, trace: bool = False, candidate_k: int = 100
+    ) -> RetrievalResult:
         t0 = time.perf_counter()
         q_vec = self._embed([query])[0]
         sims = (self._matrix @ q_vec).tolist()
-        top_idx = np.argsort(sims)[::-1][:top_k]
-        items = [_make_retrieved(self._corpus[i], float(sims[i])) for i in top_idx]
+        cand_size = max(top_k, candidate_k)
+        cand_idx = np.argsort(sims)[::-1][:cand_size]
+        final_idx = cand_idx[:top_k]
+        items = [_make_retrieved(self._corpus[i], float(sims[i])) for i in final_idx]
+        retrieval_trace: RetrievalTrace | None = None
+        if trace:
+            cand_ids = [self._corpus[i]["id"] for i in cand_idx]
+            final_ids = [it.id for it in items]
+            retrieval_trace = RetrievalTrace(
+                query=query,
+                vector_candidates=cand_ids,
+                candidate_pool=cand_ids,
+                union_candidates=cand_ids,
+                pre_rerank=cand_ids,
+                post_rerank=final_ids,
+                final_ranking=final_ids,
+                candidate_k=candidate_k,
+            )
         return RetrievalResult(
             query=query, items=items, top_k=top_k,
-            latency_ms=(time.perf_counter() - t0) * 1000,
+            latency_ms=(time.perf_counter() - t0) * 1000, trace=retrieval_trace,
         )
 
     def close(self) -> None:
@@ -225,18 +275,20 @@ class HybridRRFRetriever:
             build_wall_time_s=time.perf_counter() - t0,
         )
 
-    def query(self, query: str, top_k: int = 10, trace: bool = False) -> RetrievalResult:
+    def query(
+        self, query: str, top_k: int = 10, trace: bool = False, candidate_k: int = 100
+    ) -> RetrievalResult:
         t0 = time.perf_counter()
-        candidates = top_k * 3
+        # Use candidate_k for depth on each sub-ranker so candidate pool is measured fairly.
+        cand_size = max(top_k, candidate_k)
 
-        bm25_res = self._bm25.query(query, candidates)
+        bm25_res = self._bm25.query(query, cand_size)
         bm25_ids = [it.id for it in bm25_res.items]
 
         if self._has_vector and self._vector is not None:
-            vec_res = self._vector.query(query, candidates)
+            vec_res = self._vector.query(query, cand_size)
             vec_ids = [it.id for it in vec_res.items]
             fused = compute_rrf([bm25_ids, vec_ids], k=self._k)
-            # Build id→score map for text retrieval
             id_to_item: dict[str, dict] = {}
             for res in (bm25_res, vec_res):
                 for it in res.items:
@@ -245,7 +297,7 @@ class HybridRRFRetriever:
                         "source_episode_ids": it.source_episode_ids,
                         "node_type": it.node_type,
                     })
-            items = [
+            fused_all = [
                 RetrievedItem(
                     id=doc_id,
                     text=id_to_item[doc_id].get("text", ""),
@@ -254,15 +306,37 @@ class HybridRRFRetriever:
                     node_type=id_to_item[doc_id].get("node_type", "episode"),
                     stage_scores={"rrf": score},
                 )
-                for doc_id, score in fused[:top_k]
+                for doc_id, score in fused
                 if doc_id in id_to_item
             ]
+            items = fused_all[:top_k]
         else:
-            items = bm25_res.items[:top_k]
+            fused_all = bm25_res.items
+            items = fused_all[:top_k]
 
+        retrieval_trace: RetrievalTrace | None = None
+        if trace:
+            pool = list({
+                **{it.id: it for it in bm25_res.items},
+                **({it.id: it for it in (vec_res.items if self._has_vector else [])})
+            })
+            union_ids = [it.id for it in fused_all]
+            final_ids = [it.id for it in items]
+            retrieval_trace = RetrievalTrace(
+                query=query,
+                bm25_candidates=bm25_ids,
+                vector_candidates=[it.id for it in (vec_res.items if self._has_vector else [])],
+                candidate_pool=pool,
+                union_candidates=union_ids,
+                post_fusion_ranking=union_ids,
+                pre_rerank=union_ids,
+                post_rerank=final_ids,
+                final_ranking=final_ids,
+                candidate_k=candidate_k,
+            )
         return RetrievalResult(
             query=query, items=items, top_k=top_k,
-            latency_ms=(time.perf_counter() - t0) * 1000,
+            latency_ms=(time.perf_counter() - t0) * 1000, trace=retrieval_trace,
         )
 
     def close(self) -> None:
@@ -294,6 +368,7 @@ class OracleRetriever:
         query: str,
         top_k: int = 10,
         trace: bool = False,
+        candidate_k: int = 100,
         evidence_ids: list[str] | None = None,
     ) -> RetrievalResult:
         """Oracle requires evidence_ids to be passed from sample metadata."""

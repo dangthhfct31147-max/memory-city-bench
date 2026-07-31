@@ -22,6 +22,9 @@ class QuestionCategory(str, Enum):
     GLOBAL_COMMUNITY = "global_community"
     PROCEDURAL = "procedural"
     DISTRACTOR = "distractor"
+    # Neutral label for LoCoMo category 4: the official release does not publish a
+    # verified number→name mapping, so we avoid inventing a semantic name here.
+    LOCOMO_CATEGORY_4 = "locomo_category_4"
 
 
 class EpisodeTurn(BaseModel):

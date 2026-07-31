@@ -66,18 +66,53 @@ def test_isolated_evidence_survives_to_top_k():
     retriever.close()
 
 
+def test_graph_expansion_actually_runs_when_routed():
+    """The graph route must genuinely fire — the old test never exercised it.
+
+    The reviewer's point (issue #10): the previous query used a bare rare token
+    with no proper noun, so the coordinator's confidence stayed below the fallback
+    threshold and Memory City silently fell back to Hybrid RRF. Naming a proper
+    noun ("Alice") that the coordinator recognises routes to LOCAL_GRAPH and makes
+    graph expansion actually run. This test asserts the *mechanism* fired; it does
+    not assert ranking, because adding the entity term deliberately shifts the
+    lexical signal toward the connected cluster.
+    """
+    retriever = MemoryCityRetriever(enable_vector=False, enable_graph_expansion=True)
+    retriever.build(_corpus())
+    result = retriever.query(
+        "What did Alice say about the platform roadmap?", top_k=3, trace=True
+    )
+    assert result.trace is not None
+    assert "LOCAL_GRAPH" in result.trace.routes
+    assert "graph_expand" in result.trace.stage_latency_ms
+    # Graph expansion should have surfaced at least one supplemental candidate.
+    assert result.trace.graph_candidates
+    retriever.close()
+
+
 def test_graph_expansion_does_not_evict_strong_hit():
     """With graph expansion on, the strong hit still ranks first.
 
     Graph expansion adds neighbours of the dense cluster, but those are
     supplements: they must not push the decisive isolated hit out of top-k.
+
+    The coordinator is disabled so graph expansion fires unconditionally (pure
+    ablation) without the query needing an entity term that would itself distort
+    the lexical ranking.
     """
-    retriever = MemoryCityRetriever(enable_vector=False, enable_graph_expansion=True)
+    retriever = MemoryCityRetriever(
+        enable_vector=False,
+        enable_graph_expansion=True,
+        coordinator_enabled=False,
+    )
     retriever.build(_corpus())
-    result = retriever.query("zorblaxian artifact vault", top_k=3)
+    result = retriever.query("zorblaxian artifact vault", top_k=3, trace=True)
     ids = result.episode_ids()
     assert "ep_evidence" in ids
     assert ids[0] == "ep_evidence"
+    # Graph expansion must have actually run (coordinator off → unconditional).
+    assert result.trace is not None
+    assert "graph_expand" in result.trace.stage_latency_ms
     retriever.close()
 
 

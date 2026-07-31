@@ -198,13 +198,19 @@ class RetrievalBenchmarkRunner:
             agg_index_stats["community_count"] += stats.community_count
             agg_index_stats["embedding_count"] += stats.embedding_count
 
+            candidate_k = max(self._candidate_ks) if self._candidate_ks else 100
             for ws in scope_samples[: min(self._warmup, len(scope_samples))]:
-                retriever.query(ws.query, top_k=max(self._top_ks))
+                retriever.query(ws.query, top_k=max(self._top_ks), candidate_k=candidate_k)
 
             for sample in scope_samples:
                 try:
                     t0 = time.perf_counter()
-                    result = retriever.query(sample.query, top_k=max(self._top_ks), trace=True)
+                    result = retriever.query(
+                        sample.query,
+                        top_k=max(self._top_ks),
+                        trace=True,
+                        candidate_k=candidate_k,
+                    )
                     latency_ms = (time.perf_counter() - t0) * 1000
                     latency_stats.record(latency_ms)
                     rss_samples.append(get_process_rss_mb())
@@ -265,7 +271,24 @@ class RetrievalBenchmarkRunner:
         write_jsonl(run_dir / f"per_query_metrics_{seed}.jsonl", per_query_metrics)
         write_jsonl(run_dir / f"failures_{seed}.jsonl", failures)
 
-        agg = aggregate_metrics(per_query_metrics)
+        # Split answerable vs. abstention queries (review issue #5).
+        # Abstention queries have no ground-truth evidence: recall is trivially 1.0,
+        # which would artificially inflate the overall number.  Report them in their
+        # own bucket and exclude them from the main aggregate.
+        answerable_qms = [
+            qm for qm in per_query_metrics
+            if qm.get("category") != "abstention"
+        ]
+        abstention_qms = [
+            qm for qm in per_query_metrics
+            if qm.get("category") == "abstention"
+        ]
+        # Primary aggregate uses only answerable queries.
+        agg = aggregate_metrics(answerable_qms if answerable_qms else per_query_metrics)
+        agg["answerable_count"] = float(len(answerable_qms))
+        agg["abstention_count"] = float(len(abstention_qms))
+        abstention_agg = aggregate_metrics(abstention_qms) if abstention_qms else {}
+
         by_cat: dict[str, list[dict]] = {}
         for qm in per_query_metrics:
             by_cat.setdefault(qm.get("category", "unknown"), []).append(qm)
@@ -286,6 +309,7 @@ class RetrievalBenchmarkRunner:
             ),
             "metrics": agg,
             "metrics_by_category": cat_metrics,
+            "abstention_metrics": abstention_agg,
         }
 
     def _aggregate_seeds(self, seed_results: list[dict]) -> dict:

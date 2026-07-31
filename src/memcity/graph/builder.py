@@ -43,6 +43,7 @@ class MemoryCityGraphBuilder:
         num_topic_hubs: int = 8,
         community_algorithm: str = "greedy",
         embedding_model: str | None = None,
+        enable_be: bool = True,
     ) -> None:
         self._store = store
         self._sem_thresh = semantic_threshold
@@ -51,6 +52,7 @@ class MemoryCityGraphBuilder:
         self._community_alg = community_algorithm
         self._emb_model_name = embedding_model
         self._emb_model: Any = None
+        self._enable_be = enable_be
         self.G = nx.DiGraph()
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -59,7 +61,8 @@ class MemoryCityGraphBuilder:
         """Build complete Memory City graph from raw episode dicts."""
         self.G = nx.DiGraph()
         self._build_episode_nodes(episodes)
-        self._build_be_nodes(episodes)
+        if self._enable_be:
+            self._build_be_nodes(episodes)
         self._build_entity_nodes(episodes)
         self._build_semantic_edges()
         self._build_topic_hubs()
@@ -123,8 +126,10 @@ class MemoryCityGraphBuilder:
             b_id = make_id("begin", f"{session_id}_begin")
             e_id = make_id("end", f"{session_id}_end")
 
-            b_text = first.get("user_text", "")[:256]
-            e_text = last.get("assistant_text", "")[:256]
+            b_text = (first.get("user_text") or first.get("text") or "")[:256]
+            # assistant_text may be empty for LoCoMo (all text is in user_text/text).
+            # Fall back to the full turn text so End nodes are never blank.
+            e_text = (last.get("assistant_text") or last.get("text") or last.get("user_text") or "")[:256]
 
             for node_id, text, ntype in ((b_id, b_text, NodeType.BEGIN), (e_id, e_text, NodeType.END)):
                 node_data = {

@@ -20,36 +20,73 @@ from memcity.retrieval.baselines import (
 )
 from memcity.retrieval.memory_city import MemoryCityRetriever
 
-# Ablation flag presets. Each disables exactly the components not named, so the
-# reported delta between two variants isolates a single component's effect.
+# Ablation presets.
+#
+# Two disciplined designs are provided (review issue #8):
+#
+#  * INDEPENDENT — every variant starts from the SAME hybrid baseline
+#    (coordinator OFF so it never adds noise) and enables exactly ONE component.
+#    The delta of ``hybrid_<x>`` minus ``hybrid`` isolates component x's effect.
+#
+#  * CUMULATIVE ("ladder") — each step adds exactly ONE component on top of the
+#    previous step, ending at full Memory City. Adjacent deltas attribute gain
+#    to the single component that was switched on at that step.
+#
+# The key correctness fix: with ``coordinator_enabled=False`` the retriever fires
+# every enabled component unconditionally (see MemoryCityRetriever._route_active),
+# so a flag genuinely turns its component on rather than depending on the
+# coordinator's routing decision. B/E enables graph traversal so it can actually
+# be exercised (the flag alone was previously a no-op).
+
+# Baseline shared by the independent variants: everything off, coordinator off.
+_HYBRID_BASE = dict(
+    enable_graph_expansion=False, enable_temporal=False,
+    enable_community=False, enable_provenance=False, enable_be=False,
+    coordinator_enabled=False,
+)
+
+
+def _with(**overrides: object) -> dict:
+    cfg = dict(_HYBRID_BASE)
+    cfg.update(overrides)
+    return cfg
+
+
 _ABLATION_CONFIGS: dict[str, dict] = {
-    # Hybrid = BM25 + vector RRF only (graph/temporal/community/provenance off).
-    "hybrid_mc": dict(
-        enable_graph_expansion=False, enable_temporal=False,
-        enable_community=False, enable_provenance=False, enable_be=False,
-        coordinator_enabled=False,
+    # ── Independent ablation (each adds ONE component to the hybrid base) ──────
+    "hybrid": _with(),  # BM25 + vector RRF only — the common baseline
+    "hybrid_mc": _with(),  # legacy alias for the hybrid baseline
+    "hybrid_coordinator": _with(coordinator_enabled=True),
+    "hybrid_temporal": _with(enable_temporal=True),
+    "hybrid_graph": _with(enable_graph_expansion=True),
+    "hybrid_community": _with(enable_community=True),
+    # B/E needs graph traversal to matter, so it turns graph expansion on and
+    # builds B/E nodes; compare against hybrid_graph to isolate the B/E effect.
+    "hybrid_be": _with(enable_graph_expansion=True, enable_be=True),
+    "hybrid_provenance": _with(enable_provenance=True),
+    "hybrid_graph_temporal": _with(enable_graph_expansion=True, enable_temporal=True),
+
+    # ── Cumulative ladder (each step adds exactly one component) ──────────────
+    "ladder_0_hybrid": _with(),
+    "ladder_1_coordinator": _with(coordinator_enabled=True),
+    "ladder_2_temporal": _with(coordinator_enabled=True, enable_temporal=True),
+    "ladder_3_graph": _with(
+        coordinator_enabled=True, enable_temporal=True, enable_graph_expansion=True,
     ),
-    "hybrid_temporal": dict(
-        enable_graph_expansion=False, enable_temporal=True,
-        enable_community=False, enable_provenance=False, enable_be=False,
+    "ladder_4_community": _with(
+        coordinator_enabled=True, enable_temporal=True, enable_graph_expansion=True,
+        enable_community=True,
     ),
-    "hybrid_graph": dict(
-        enable_graph_expansion=True, enable_temporal=False,
-        enable_community=False, enable_provenance=False, enable_be=False,
+    "ladder_5_be": _with(
+        coordinator_enabled=True, enable_temporal=True, enable_graph_expansion=True,
+        enable_community=True, enable_be=True,
     ),
-    "hybrid_community": dict(
-        enable_graph_expansion=False, enable_temporal=False,
-        enable_community=True, enable_provenance=False, enable_be=False,
+    "ladder_6_provenance": _with(
+        coordinator_enabled=True, enable_temporal=True, enable_graph_expansion=True,
+        enable_community=True, enable_be=True, enable_provenance=True,
     ),
-    "hybrid_be": dict(
-        enable_graph_expansion=False, enable_temporal=False,
-        enable_community=False, enable_provenance=False, enable_be=True,
-    ),
-    "hybrid_graph_temporal": dict(
-        enable_graph_expansion=True, enable_temporal=True,
-        enable_community=False, enable_provenance=False, enable_be=False,
-    ),
-    "memory_city_full": {},  # all components on (defaults)
+
+    "memory_city_full": {},  # all components on (defaults, coordinator on)
 }
 
 
@@ -88,16 +125,39 @@ def list_methods() -> list[str]:
 
 
 def ablation_methods() -> list[str]:
-    """Ordered ablation ladder from plain hybrid up to full Memory City."""
+    """Cumulative ablation ladder: each step adds exactly one component.
+
+    Adjacent deltas attribute gain/loss to the single component switched on at
+    that step, ending at full Memory City. Baselines are included at the top
+    for reference.
+    """
     return [
         "bm25",
         "vector",
         "hybrid_rrf",
-        "hybrid_mc",
+        "ladder_0_hybrid",
+        "ladder_1_coordinator",
+        "ladder_2_temporal",
+        "ladder_3_graph",
+        "ladder_4_community",
+        "ladder_5_be",
+        "ladder_6_provenance",
+        "memory_city_full",
+    ]
+
+
+def independent_ablation_methods() -> list[str]:
+    """Independent ablation: each variant adds one component to the same baseline.
+
+    ``hybrid_<x>`` minus ``hybrid`` isolates component x against a fixed baseline
+    (coordinator off, so routing never confounds the delta).
+    """
+    return [
+        "hybrid",
+        "hybrid_coordinator",
         "hybrid_temporal",
         "hybrid_graph",
         "hybrid_community",
         "hybrid_be",
-        "hybrid_graph_temporal",
-        "memory_city_full",
+        "hybrid_provenance",
     ]
