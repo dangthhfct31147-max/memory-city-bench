@@ -48,6 +48,12 @@ _DEFAULT_MODEL = "qwen3-0.6b"
 # cache for this request (benchmark correctness).
 GATEWAY_NO_CACHE_HEADER = "X-OmniRoute-No-Cache"
 
+# Local response-cache modes.
+#   read-write : read hits, write misses (default; dev smoke tests)
+#   read-only  : read hits, never write (frozen cache)
+#   off        : never read, never write (mandatory for latency benchmarks)
+_CACHE_MODES = frozenset({"read-write", "read-only", "off"})
+
 
 # ── Response schema ────────────────────────────────────────────────────────────
 
@@ -75,6 +81,12 @@ class ReaderResult(BaseModel):
     effective_model: str = ""
     effective_provider: str = ""
     fallback_warning: bool = False
+    # Cache / latency provenance. upstream_latency_ms is the real network round
+    # trip (0.0 on a local cache hit); local_lookup_latency_ms is the time spent
+    # reading the local cache. They must never be mixed in latency stats.
+    cache_hit: bool = False
+    upstream_latency_ms: float = 0.0
+    local_lookup_latency_ms: float = 0.0
 
 
 # ── Cache ──────────────────────────────────────────────────────────────────────
@@ -238,6 +250,8 @@ class OpenAICompatibleReader:
         api_key: str | None = None,
         extra_headers: dict[str, str] | None = None,
         gateway_no_cache: bool = False,
+        cache_mode: str = "read-write",
+        omniroute_provider: str | None = None,
         transport: Any = None,
     ) -> None:
         # Resolve base_url/model from the environment when not passed explicitly.
@@ -253,6 +267,25 @@ class OpenAICompatibleReader:
         self.timeout_s = timeout_s
         self.context_token_budget = context_token_budget
         self._cache = ResponseCache(cache_path or Path("data/reader_cache.jsonl"))
+
+        if cache_mode not in _CACHE_MODES:
+            raise ValueError(
+                f"cache_mode must be one of {sorted(_CACHE_MODES)}, got {cache_mode!r}"
+            )
+        self.cache_mode = cache_mode
+
+        # OmniRoute provider-locked route: when set, chat completions go to
+        # /v1/providers/<id>/chat/completions, which returns 400 (rather than
+        # silently falling back) if the model is not served by that provider.
+        # /models health check always stays on the base URL.
+        self.omniroute_provider = omniroute_provider
+        self.models_url = f"{self.base_url}/models"
+        if omniroute_provider:
+            self.chat_completions_url = (
+                f"{self.base_url}/providers/{omniroute_provider}/chat/completions"
+            )
+        else:
+            self.chat_completions_url = f"{self.base_url}/chat/completions"
 
         # Secret handling: the key is stored on the instance only to build the
         # Authorization header. It is never placed in the cache key, cache file,
@@ -320,7 +353,7 @@ class OpenAICompatibleReader:
         """
         try:
             with self._client() as client:
-                resp = client.get(f"{self.base_url}/models", headers=self._build_headers())
+                resp = client.get(self.models_url, headers=self._build_headers())
                 resp.raise_for_status()
                 data = resp.json()
         except Exception as exc:
@@ -346,21 +379,35 @@ class OpenAICompatibleReader:
     ) -> ReaderResult:
         prompt = build_prompt(query, evidence, self.context_token_budget)
         key_fields = self._cache_key_fields(prompt)
-        cached = self._cache.get(key_fields)
 
-        t0 = time.perf_counter()
+        # Local cache read (only when the mode permits it). We measure the lookup
+        # time separately so it is never conflated with upstream latency.
+        cache_hit = False
+        cache_hit_latency_ms = 0.0
+        cached = None
+        if self.cache_mode in ("read-write", "read-only"):
+            t_lookup = time.perf_counter()
+            cached = self._cache.get(key_fields)
+            cache_hit_latency_ms = (time.perf_counter() - t_lookup) * 1000
+
         effective_model = self.model
         effective_provider = ""
         if cached:
+            cache_hit = True
             resp_data = cached["response"]
             raw_response = resp_data.get("raw", "")
             prompt_tokens = resp_data.get("prompt_tokens", 0)
             completion_tokens = resp_data.get("completion_tokens", 0)
-            latency_ms = resp_data.get("latency_ms", 0.0)
+            # A cache hit performs no network call: upstream latency is 0 and the
+            # reported latency is the local lookup, not a stale prior round trip.
+            upstream_latency_ms = 0.0
+            local_lookup_latency_ms = cache_hit_latency_ms
+            latency_ms = local_lookup_latency_ms
             effective_model = resp_data.get("effective_model", self.model)
             effective_provider = resp_data.get("effective_provider", "")
         else:
-            httpx = self._get_httpx()
+            # Ensure httpx is importable (raises a helpful error otherwise).
+            self._get_httpx()
             payload = {
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
@@ -368,18 +415,24 @@ class OpenAICompatibleReader:
                 "seed": self.seed,
                 "max_tokens": self.max_tokens,
             }
+            t_upstream = time.perf_counter()
             try:
                 with self._client() as client:
                     resp = client.post(
-                        f"{self.base_url}/chat/completions",
+                        self.chat_completions_url,
                         json=payload,
                         headers=self._build_headers(),
                     )
                     resp.raise_for_status()
                     data = resp.json()
-                    # Provider is surfaced via a response header by OmniRoute-style
-                    # gateways; captured before the client context closes.
-                    effective_provider = resp.headers.get("X-OmniRoute-Provider", "")
+                    # Provider is surfaced via a response header by some
+                    # OmniRoute-style gateways, but it is NOT part of the
+                    # documented public header set, so treat it as best-effort:
+                    # fall back to the pinned provider-locked route id, else "".
+                    effective_provider = (
+                        resp.headers.get("X-OmniRoute-Provider", "")
+                        or (self.omniroute_provider or "")
+                    )
                 raw_response = data["choices"][0]["message"]["content"]
                 usage = data.get("usage", {})
                 prompt_tokens = usage.get("prompt_tokens", 0)
@@ -388,25 +441,32 @@ class OpenAICompatibleReader:
                 # the requested model means a fallback/switch occurred.
                 effective_model = data.get("model", self.model) or self.model
             except Exception as exc:
+                upstream_latency_ms = (time.perf_counter() - t_upstream) * 1000
                 return ReaderResult(
                     sample_id=sample_id,
                     retriever=retriever_name,
                     error=self._redact(str(exc)),
-                    latency_ms=(time.perf_counter() - t0) * 1000,
+                    latency_ms=upstream_latency_ms,
                     requested_model=self.requested_model,
+                    cache_hit=False,
+                    upstream_latency_ms=upstream_latency_ms,
+                    local_lookup_latency_ms=cache_hit_latency_ms,
                 )
-            latency_ms = (time.perf_counter() - t0) * 1000
-            self._cache.put(
-                key_fields,
-                {
-                    "raw": raw_response,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "latency_ms": latency_ms,
-                    "effective_model": effective_model,
-                    "effective_provider": effective_provider,
-                },
-            )
+            upstream_latency_ms = (time.perf_counter() - t_upstream) * 1000
+            local_lookup_latency_ms = cache_hit_latency_ms
+            latency_ms = upstream_latency_ms
+            if self.cache_mode == "read-write":
+                self._cache.put(
+                    key_fields,
+                    {
+                        "raw": raw_response,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "latency_ms": upstream_latency_ms,
+                        "effective_model": effective_model,
+                        "effective_provider": effective_provider,
+                    },
+                )
 
         fallback_warning = (
             effective_model != "" and effective_model != self.requested_model
@@ -427,12 +487,16 @@ class OpenAICompatibleReader:
             effective_model=effective_model,
             effective_provider=effective_provider,
             fallback_warning=fallback_warning,
+            cache_hit=cache_hit,
+            upstream_latency_ms=upstream_latency_ms,
+            local_lookup_latency_ms=local_lookup_latency_ms,
         )
 
     def __repr__(self) -> str:
         # Never expose the api key.
         return (
             f"OpenAICompatibleReader(base_url={self.base_url!r}, model={self.model!r}, "
+            f"provider={self.omniroute_provider!r}, cache_mode={self.cache_mode!r}, "
             f"auth={'yes' if self._api_key else 'no'})"
         )
 

@@ -25,7 +25,15 @@ reader:
   # api_key_env names the environment variable holding the key; the key value
   # itself is never stored in config or run artifacts.
   api_key_env: MEMCITY_LLM_API_KEY
-  disable_gateway_cache: false
+  # Bypass the gateway's own semantic cache (default true; keep true for
+  # published runs so a stale generation is never scored).
+  disable_gateway_cache: true
+  # Local response cache: off | read-only | read-write. Use 'off' for latency
+  # benchmarks so nothing is served from disk.
+  cache_mode: read-write
+  # Optional OmniRoute provider id; routes chat to
+  # /v1/providers/<id>/chat/completions (errors instead of falling back).
+  omniroute_provider: null
 
 benchmark:
   dataset: synthetic-tiny

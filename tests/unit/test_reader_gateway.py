@@ -7,7 +7,6 @@ is not installed.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -176,9 +175,15 @@ def test_second_identical_call_hits_cache(tmp_path):
         return _chat_response()
 
     reader = _make_reader(tmp_path, handler)
-    reader.answer(sample_id="s1", query="q", evidence=[{"id": "ep-1", "text": "x"}])
-    reader.answer(sample_id="s2", query="q", evidence=[{"id": "ep-1", "text": "x"}])
+    r1 = reader.answer(sample_id="s1", query="q", evidence=[{"id": "ep-1", "text": "x"}])
+    r2 = reader.answer(sample_id="s2", query="q", evidence=[{"id": "ep-1", "text": "x"}])
     assert calls["n"] == 1  # second call served from cache
+    assert r1.cache_hit is False
+    assert r2.cache_hit is True
+    # A cache hit performs no upstream call.
+    assert r2.upstream_latency_ms == 0.0
+    # First (real) call records upstream latency, not a local lookup.
+    assert r1.upstream_latency_ms >= 0.0
 
 
 def test_temperature_change_busts_cache(tmp_path):
@@ -292,3 +297,103 @@ def test_cache_key_is_stable_and_field_sensitive():
     assert k1 == k2
     k3 = ResponseCache.make_key({**base, "prompt": "different"})
     assert k1 != k3
+
+
+# ── Cache modes ──────────────────────────────────────────────────────────────────
+
+
+def test_cache_mode_off_never_reads_or_writes(tmp_path):
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _chat_response()
+
+    cache = tmp_path / "cache.jsonl"
+    kwargs = dict(base_url="http://localhost:20128/v1", model="qwen3-0.6b", cache_path=cache)
+    OpenAICompatibleReader(**kwargs, cache_mode="off",
+                           transport=httpx.MockTransport(handler)).answer("s", "q", [])
+    r2 = OpenAICompatibleReader(**kwargs, cache_mode="off",
+                                transport=httpx.MockTransport(handler)).answer("s", "q", [])
+    assert calls["n"] == 2  # never served from disk
+    assert r2.cache_hit is False
+    assert not cache.exists() or cache.read_text(encoding="utf-8").strip() == ""
+
+
+def test_cache_mode_read_only_reads_but_does_not_write(tmp_path):
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _chat_response()
+
+    cache = tmp_path / "cache.jsonl"
+    kwargs = dict(base_url="http://localhost:20128/v1", model="qwen3-0.6b", cache_path=cache)
+    # Prime the cache with a read-write reader.
+    OpenAICompatibleReader(**kwargs, cache_mode="read-write",
+                           transport=httpx.MockTransport(handler)).answer("s", "q", [])
+    assert calls["n"] == 1
+    # read-only reader serves the primed entry (no new call)...
+    r2 = OpenAICompatibleReader(**kwargs, cache_mode="read-only",
+                                transport=httpx.MockTransport(handler)).answer("s", "q", [])
+    assert r2.cache_hit is True
+    assert calls["n"] == 1
+    # ...but a fresh prompt is fetched and NOT written back.
+    r3reader = OpenAICompatibleReader(**kwargs, cache_mode="read-only",
+                                      transport=httpx.MockTransport(handler))
+    r3reader.answer("s", "different question", [])
+    assert calls["n"] == 2
+    # Re-reading that prompt still misses because read-only never wrote it.
+    OpenAICompatibleReader(**kwargs, cache_mode="read-only",
+                           transport=httpx.MockTransport(handler)).answer("s", "different question", [])
+    assert calls["n"] == 3
+
+
+def test_invalid_cache_mode_raises(tmp_path):
+    with pytest.raises(ValueError):
+        OpenAICompatibleReader(
+            base_url="http://localhost:20128/v1", model="m",
+            cache_path=tmp_path / "c.jsonl", cache_mode="bogus",
+        )
+
+
+# ── Provider-locked route ────────────────────────────────────────────────────────
+
+
+def test_omniroute_provider_changes_chat_url(tmp_path):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        return _chat_response()
+
+    reader = _make_reader(tmp_path, handler, omniroute_provider="openai")
+    assert reader.chat_completions_url.endswith("/v1/providers/openai/chat/completions")
+    # Health check stays on the plain /models endpoint.
+    assert reader.models_url.endswith("/v1/models")
+    reader.answer(sample_id="s1", query="q", evidence=[])
+    assert seen["path"].endswith("/v1/providers/openai/chat/completions")
+
+
+def test_effective_provider_falls_back_to_pinned_provider(tmp_path):
+    # No X-OmniRoute-Provider header, but a provider was pinned → best-effort
+    # attribution uses the pinned id.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _chat_response()  # no provider header
+
+    reader = _make_reader(tmp_path, handler, omniroute_provider="anthropic")
+    rr = reader.answer(sample_id="s1", query="q", evidence=[])
+    assert rr.effective_provider == "anthropic"
+
+
+def test_provider_mismatch_400_is_surfaced_as_error(tmp_path):
+    # A provider-locked route returns 400 when the model is not served by that
+    # provider — this must become a clean error, not a silent fallback.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "model not available for provider"})
+
+    reader = _make_reader(tmp_path, handler, omniroute_provider="openai")
+    rr = reader.answer(sample_id="s1", query="q", evidence=[])
+    assert rr.answer is None
+    assert rr.error != ""
+    assert rr.cache_hit is False

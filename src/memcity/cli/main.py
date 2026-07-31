@@ -388,8 +388,27 @@ def benchmark_e2e(
         help="Extra request header as 'Name: Value'. Repeatable.",
     ),
     reader_disable_gateway_cache: bool = typer.Option(
-        False, "--reader-disable-gateway-cache",
-        help="Send X-OmniRoute-No-Cache: true so the gateway does not serve a cached generation.",
+        True, "--reader-disable-gateway-cache/--reader-allow-gateway-cache",
+        help=(
+            "Send X-OmniRoute-No-Cache: true so the gateway never serves a cached "
+            "generation. Default (and required for published runs) is to disable "
+            "the gateway cache."
+        ),
+    ),
+    reader_cache_mode: str = typer.Option(
+        "read-write", "--reader-cache-mode",
+        help=(
+            "Local response cache mode: off | read-only | read-write. Use 'off' for "
+            "latency benchmarks so no result is ever served from disk."
+        ),
+    ),
+    reader_omniroute_provider: str | None = typer.Option(
+        None, "--reader-omniroute-provider",
+        help=(
+            "Pin an OmniRoute provider id. Routes chat completions to "
+            "/v1/providers/<id>/chat/completions, which errors instead of falling "
+            "back if the model is not served by that provider."
+        ),
     ),
     context_token_budget: int = typer.Option(4096, "--context-token-budget"),
     top_k: int = typer.Option(5, "--top-k"),
@@ -437,6 +456,13 @@ def benchmark_e2e(
         name, _, value = raw_header.partition(":")
         extra_headers[name.strip()] = value.strip()
 
+    if reader_cache_mode not in ("off", "read-only", "read-write"):
+        console.print(
+            f"[red]Invalid --reader-cache-mode: {reader_cache_mode} "
+            f"(expected off | read-only | read-write)[/red]"
+        )
+        raise typer.Exit(1)
+
     if reader_provider in ("oracle", "none"):
         reader = OracleReader()
         use_oracle = True
@@ -451,12 +477,16 @@ def benchmark_e2e(
                 "explicit model id for reproducible runs.[/red]"
             )
             raise typer.Exit(1)
-        # Benchmark runs always bypass the gateway's own response cache so a
-        # stale generation is never scored (requirement #6). The
-        # --reader-disable-gateway-cache flag makes that intent explicit; the
-        # header is sent regardless for benchmark correctness. Local per-run
-        # caching (cache_path) is unaffected and still deduplicates identical
-        # prompts within a run.
+        # The gateway (semantic) cache bypass is honoured exactly as requested:
+        # the flag value is passed straight through and the same value is
+        # recorded in the artifact, so request behaviour and audit record can
+        # never disagree. Default is bypassed; published runs must keep it so.
+        if not reader_disable_gateway_cache:
+            console.print(
+                "[yellow]Gateway cache is ENABLED (--reader-allow-gateway-cache). "
+                "Do not use this for a published benchmark: the gateway may serve "
+                "a stale generation.[/yellow]"
+            )
         reader = OpenAICompatibleReader(
             base_url=effective_base_url,
             model=effective_model,
@@ -464,12 +494,17 @@ def benchmark_e2e(
             cache_path=Path(data_dir) / "reader_cache.jsonl",
             api_key=api_key,
             extra_headers=extra_headers,
-            gateway_no_cache=True,
+            gateway_no_cache=reader_disable_gateway_cache,
+            cache_mode=reader_cache_mode,
+            omniroute_provider=reader_omniroute_provider,
         )
         use_oracle = False
         # Report auth/endpoint status without ever printing the key.
         console.print(
             f"[dim]Reader endpoint: {effective_base_url} | model: {effective_model} | "
+            f"provider: {reader_omniroute_provider or '(gateway default)'} | "
+            f"gateway_cache_bypassed: {reader_disable_gateway_cache} | "
+            f"local_cache_mode: {reader_cache_mode} | "
             f"auth: {'yes' if api_key else 'no'} | "
             f"env var: {reader_api_key_env}[/dim]"
         )
@@ -588,15 +623,36 @@ def benchmark_e2e(
                 if rr.get("effective_provider")
             })
             fallback_count = sum(1 for rr in reader_results if rr.get("fallback_warning"))
+            cache_hits = sum(1 for rr in reader_results if rr.get("cache_hit"))
+            # Latency is reported separately for real upstream calls vs cache
+            # hits so the two are never mixed in one statistic.
+            upstream = [
+                rr.get("upstream_latency_ms", 0.0) for rr in reader_results
+                if not rr.get("cache_hit") and not rr.get("error")
+            ]
             metrics["requested_model"] = effective_model
             metrics["effective_models_observed"] = observed_models
             metrics["effective_providers_observed"] = observed_providers
             metrics["fallback_warning_count"] = fallback_count
+            metrics["gateway_cache_bypassed"] = reader_disable_gateway_cache
+            metrics["local_cache_mode"] = reader_cache_mode
+            metrics["cache_hit_count"] = cache_hits
+            metrics["upstream_call_count"] = len(upstream)
+            metrics["mean_upstream_latency_ms"] = (
+                sum(upstream) / len(upstream) if upstream else 0.0
+            )
             if fallback_count:
                 console.print(
                     f"[yellow]WARNING: {fallback_count}/{len(reader_results)} responses came "
                     f"from a model other than the pinned '{effective_model}'. Do not publish "
                     f"this as a pinned-model benchmark run. Observed: {observed_models}[/yellow]"
+                )
+            if cache_hits and reader_cache_mode != "off":
+                console.print(
+                    f"[yellow]NOTE: {cache_hits}/{len(reader_results)} answers served from the "
+                    f"local cache (mode={reader_cache_mode}). Latency reflects only the "
+                    f"{len(upstream)} real upstream calls. Use --reader-cache-mode off for a "
+                    f"clean latency benchmark.[/yellow]"
                 )
         all_tables.append(metrics)
 
@@ -622,11 +678,17 @@ def benchmark_e2e(
                     "scope_count": len(scope_corpora),
                     # OmniRoute config recorded WITHOUT the secret: only the env
                     # var name, whether auth was enabled, the header names, and
-                    # the no-cache flag are persisted.
+                    # the cache flags are persisted.
                     "reader_api_key_env": reader_api_key_env,
                     "reader_auth_enabled": bool(api_key) if not use_oracle else False,
                     "reader_extra_header_names": sorted(extra_headers.keys()),
-                    "reader_disable_gateway_cache": reader_disable_gateway_cache,
+                    # This is the value actually applied to the request (the
+                    # X-OmniRoute-No-Cache header), so audit and behaviour agree.
+                    "reader_gateway_cache_bypassed": (
+                        reader_disable_gateway_cache if not use_oracle else False
+                    ),
+                    "reader_local_cache_mode": reader_cache_mode if not use_oracle else "n/a",
+                    "reader_omniroute_provider": reader_omniroute_provider,
                 },
                 indent=2,
             ),

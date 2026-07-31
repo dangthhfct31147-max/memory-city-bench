@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 
 class EmbeddingConfig(BaseModel):
@@ -53,7 +53,13 @@ class ReaderConfig(BaseModel):
     # only the name of the environment variable that holds it.
     api_key_env: str = "MEMCITY_LLM_API_KEY"
     extra_headers: dict[str, str] = Field(default_factory=dict)
-    disable_gateway_cache: bool = False
+    # Bypass the gateway's own (semantic) cache. Default True so published runs
+    # never score a stale generation.
+    disable_gateway_cache: bool = True
+    # Local response-cache mode: off | read-only | read-write.
+    cache_mode: Literal["off", "read-only", "read-write"] = "read-write"
+    # Optional OmniRoute provider id for a provider-locked chat route.
+    omniroute_provider: str | None = None
 
 
 class BenchmarkConfig(BaseModel):
@@ -78,7 +84,7 @@ class MemCityConfig(BaseModel):
     log_level: str = "INFO"
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "MemCityConfig":
+    def from_yaml(cls, path: str | Path) -> MemCityConfig:
         import yaml
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
