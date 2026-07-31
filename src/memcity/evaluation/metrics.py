@@ -115,18 +115,37 @@ def compute_all_metrics(
         out[f"evidence_f1@{k}"] = evidence_f1(retrieved, relevant, k)
     out["mrr"] = mrr(retrieved, relevant)
     rank = mean_rank_first_relevant(retrieved, relevant)
-    out["mean_rank_first_relevant"] = rank if rank is not None else float("inf")
+    # Keep the legacy definition but store the sentinel as the top-k boundary
+    # (k+1) instead of +inf so JSON stays finite and averages stay meaningful.
+    boundary = max(ks) + 1 if ks else 1
+    out["mean_rank_first_relevant"] = rank if rank is not None else float(boundary)
+    # Diagnostics that do not redefine any existing metric:
+    #  - mean_rank_on_hits: rank averaged over queries that actually hit
+    #    (omitted when this query misses, so aggregation averages hits only).
+    #  - miss_rate: 1 when a query with real evidence returns none of it.
+    if relevant:
+        if rank is not None:
+            out["mean_rank_on_hits"] = rank
+        out["miss_rate"] = 0.0 if rank is not None else 1.0
     return out
 
 
 def aggregate_metrics(per_query: list[dict[str, float]]) -> dict[str, float]:
-    """Average numeric metrics across queries (skips non-numeric keys)."""
+    """Average numeric metrics across queries.
+
+    Skips non-numeric and non-finite values so a single missed query cannot
+    inject Infinity/NaN into the reported means or the serialized JSON.
+    """
     if not per_query:
         return {}
     all_keys = {k for q in per_query for k in q}
     out: dict[str, float] = {}
     for k in all_keys:
-        vals = [q[k] for q in per_query if k in q and isinstance(q[k], (int, float))]
+        vals = [
+            q[k]
+            for q in per_query
+            if k in q and isinstance(q[k], (int, float)) and math.isfinite(q[k])
+        ]
         if vals:
             out[k] = sum(vals) / len(vals)
     return out

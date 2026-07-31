@@ -99,6 +99,95 @@ def print_category_table(
     console.print(table)
 
 
+def print_evidence_loss_table(
+    per_query_metrics: list[dict],
+    method: str = "",
+    top_n: int = 20,
+    candidate_k: int = 50,
+    final_k: int = 10,
+) -> None:
+    """Show the queries where evidence was reachable but did not survive to top-k.
+
+    Loss = candidate_recall@candidate_k − final_recall@final_k. A large positive
+    loss means the evidence was in the candidate union but the graph/temporal/
+    rerank/dedup stages dropped it out of the returned top-k — exactly the
+    failure mode to diagnose. Abstention queries (no evidence) are skipped.
+    """
+    cand_key = f"candidate_recall@{candidate_k}"
+    final_key = f"final_recall@{final_k}"
+    rows = []
+    for qm in per_query_metrics:
+        if cand_key not in qm or final_key not in qm:
+            continue
+        # Skip queries with no real evidence (recall is trivially 1.0 there).
+        if qm.get("category") == "abstention":
+            continue
+        loss = qm[cand_key] - qm[final_key]
+        if loss > 0:
+            rows.append((loss, qm))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    if not rows:
+        console.print(
+            f"[green]No evidence-loss cases for {method}: "
+            f"nothing reachable was dropped before top-{final_k}.[/green]"
+        )
+        return
+
+    title = f"WORST {min(top_n, len(rows))} EVIDENCE-LOSS QUERIES — {method}"
+    table = Table(title=title, box=box.SIMPLE_HEAD)
+    table.add_column("Sample", style="bold cyan", no_wrap=True)
+    table.add_column("Category", no_wrap=True)
+    table.add_column(f"cand@{candidate_k}", justify="right")
+    table.add_column(f"final@{final_k}", justify="right")
+    table.add_column("loss", justify="right", style="red")
+    table.add_column("rerank", justify="right")
+    table.add_column("temporal", justify="right")
+    table.add_column("graphloss", justify="right")
+
+    for loss, qm in rows[:top_n]:
+        table.add_row(
+            str(qm.get("sample_id", ""))[:28],
+            str(qm.get("category", ""))[:12],
+            f"{qm.get(cand_key, 0):.2f}",
+            f"{qm.get(final_key, 0):.2f}",
+            f"{loss:.2f}",
+            f"{qm.get('evidence_lost_by_reranking', 0):.2f}",
+            f"{qm.get('evidence_lost_by_temporal', 0):.2f}",
+            f"{qm.get('graph_induced_loss', 0):.2f}",
+        )
+    console.print(table)
+
+
+def print_diagnostics_table(results: list[dict], dataset_name: str = "") -> None:
+    """Print aggregate pipeline diagnostics per method."""
+    cols = [
+        ("candidate_recall@50", "cand@50", ".3f"),
+        ("final_recall@10", "final@10", ".3f"),
+        ("graph_only_gain", "g+gain", ".3f"),
+        ("graph_induced_loss", "g-loss", ".3f"),
+        ("evidence_lost_by_reranking", "rerank-", ".3f"),
+        ("evidence_lost_by_temporal", "temp-", ".3f"),
+        ("duplicate_source_rate", "dup", ".3f"),
+        ("raw_episode_ratio", "raw%", ".3f"),
+        ("readme_ratio", "hub%", ".3f"),
+    ]
+    present = [c for c in cols if any(c[0] in r.get("metrics", {}) for r in results)]
+    if not present:
+        return
+    table = Table(title=f"PIPELINE DIAGNOSTICS — {dataset_name}", box=box.SIMPLE_HEAD)
+    table.add_column("Method", style="bold cyan", no_wrap=True)
+    for _, name, _ in present:
+        table.add_column(name, justify="right")
+    for r in results:
+        m = r.get("metrics", {})
+        row = [r.get("method", r.get("name", "unknown"))]
+        for key, _, fmt in present:
+            val = m.get(key)
+            row.append(f"{val:{fmt}}" if val is not None else "—")
+        table.add_row(*row)
+    console.print(table)
+
+
 E2E_DISPLAY_COLS = [
     ("exact_match", "EM", ".3f"),
     ("token_f1", "TokF1", ".3f"),

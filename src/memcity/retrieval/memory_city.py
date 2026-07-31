@@ -1,4 +1,19 @@
-"""Memory City full retriever — integrates all components."""
+"""Memory City full retriever — integrates all components.
+
+Design constraints (from the diagnostic review):
+
+- Scores are additive. Temporal and provenance signals *adjust* a candidate's
+  score; they never hard-reorder the whole list by timestamp. A strong lexical
+  or vector hit can only be displaced by an equally strong combined signal.
+- Graph expansion only *supplements* the candidate pool. Expanded neighbours are
+  added with a discounted score and can never evict a strong BM25/vector hit.
+- When the coordinator is not confident, the retriever falls back to plain
+  Hybrid RRF (BM25 + vector) and skips graph/temporal/community/provenance.
+- Only raw episodes reach the final result. README / topic-hub / community nodes
+  are used purely to *route* toward raw episodes.
+- Every stage is snapshotted in the trace so diagnostics can attribute where
+  evidence enters or is dropped.
+"""
 
 from __future__ import annotations
 
@@ -7,22 +22,30 @@ from typing import Any
 
 import networkx as nx
 
-from memcity.coordinator.heuristic import Coordinator, Route
-from memcity.evaluation.metrics import compute_rrf
+from memcity.coordinator.heuristic import Coordinator, CoordinatorDecision, Route
 from memcity.graph.builder import MemoryCityGraphBuilder
 from memcity.memory.schema import NodeType
 from memcity.memory.store import Store
-from memcity.retrieval.baselines import BM25Retriever, VectorRetriever, _item_text, _make_retrieved
+from memcity.retrieval.baselines import BM25Retriever, VectorRetriever, _make_retrieved
 from memcity.retrieval.protocol import IndexStats, RetrievalResult, RetrievalTrace, RetrievedItem
 from memcity.utils.helpers import tokenize
 
+# Score below which a coordinator decision is treated as unreliable and the
+# retriever falls back to plain Hybrid RRF.
+_CONFIDENCE_FALLBACK = 0.45
+# Discount applied to graph-expanded candidates so they supplement but never
+# outrank a genuine lexical/vector hit.
+_GRAPH_SUPPLEMENT_SCALE = 0.25
+# Weight of the additive temporal nudge relative to the fused retrieval score.
+_TEMPORAL_NUDGE = 0.15
+
 
 class MemoryCityRetriever:
-    """Full Memory City retrieval pipeline.
+    """Full Memory City retrieval pipeline with per-component ablation flags.
 
-    Combines lexical, vector, graph expansion, temporal filtering,
-    community routing, and provenance-aware reranking.
-    All decisions are logged in the trace.
+    The ``enable_*`` flags let the benchmark run true ablations against the same
+    index: turning a component off removes only that component's contribution,
+    leaving everything else identical.
     """
 
     name = "memory_city_full"
@@ -37,6 +60,14 @@ class MemoryCityRetriever:
         contradiction_penalty: float = 0.2,
         provenance_boost: float = 0.1,
         coordinator_enabled: bool = True,
+        *,
+        enable_vector: bool = True,
+        enable_graph_expansion: bool = True,
+        enable_temporal: bool = True,
+        enable_community: bool = True,
+        enable_provenance: bool = True,
+        enable_be: bool = True,
+        name: str | None = None,
     ) -> None:
         self._rrf_k = rrf_k
         self._hop_limit = graph_hop_limit
@@ -46,6 +77,15 @@ class MemoryCityRetriever:
         self._contra_penalty = contradiction_penalty
         self._prov_boost = provenance_boost
         self._coord_enabled = coordinator_enabled
+
+        self._enable_vector = enable_vector
+        self._enable_graph_expansion = enable_graph_expansion
+        self._enable_temporal = enable_temporal
+        self._enable_community = enable_community
+        self._enable_provenance = enable_provenance
+        self._enable_be = enable_be
+        if name:
+            self.name = name
 
         self._store: Store | None = None
         self._graph: nx.DiGraph | None = None
@@ -58,21 +98,20 @@ class MemoryCityRetriever:
     def build(self, corpus: list[dict], config: Any = None) -> IndexStats:
         t0 = time.perf_counter()
         self._corpus = list(corpus)
-        self._store = Store()  # in-memory store for graph data
+        self._store = Store()
 
-        # Build BM25 index
         self._bm25 = BM25Retriever()
         self._bm25.build(corpus, config)
 
-        # Build vector index (optional)
-        try:
-            self._vector = VectorRetriever()
-            self._vector.build(corpus, config)
-            self._has_vector = True
-        except ImportError:
-            self._has_vector = False
+        self._has_vector = False
+        if self._enable_vector:
+            try:
+                self._vector = VectorRetriever()
+                self._vector.build(corpus, config)
+                self._has_vector = True
+            except ImportError:
+                self._has_vector = False
 
-        # Build Memory City graph
         builder = MemoryCityGraphBuilder(
             store=self._store,
             semantic_threshold=self._sem_thresh,
@@ -98,6 +137,8 @@ class MemoryCityRetriever:
     def query(self, query: str, top_k: int = 10, trace: bool = False) -> RetrievalResult:
         t0 = time.perf_counter()
         stage_latency: dict[str, float] = {}
+        # Keep a deep candidate pool so candidate_recall diagnostics are meaningful.
+        candidates = max(top_k * 4, 100)
 
         # ── Coordinator routing ───────────────────────────────────────────────
         if self._coord_enabled:
@@ -105,22 +146,19 @@ class MemoryCityRetriever:
             decision = self._coordinator.route(query)
             stage_latency["coordinator"] = (time.perf_counter() - t1) * 1000
         else:
-            from memcity.coordinator.heuristic import CoordinatorDecision
             decision = CoordinatorDecision(
-                routes=[Route.HYBRID],
-                features={},
-                weights={"lexical": 0.5, "vector": 0.5},
+                routes=[Route.HYBRID], features={}, weights={"lexical": 0.5, "vector": 0.5},
+                confidence=1.0,
             )
 
-        candidates = top_k * 4
+        low_confidence = decision.confidence < _CONFIDENCE_FALLBACK
 
-        # ── BM25 retrieval ────────────────────────────────────────────────────
+        # ── Component retrieval ───────────────────────────────────────────────
         t1 = time.perf_counter()
         bm25_res = self._bm25.query(query, candidates) if self._bm25 else None
         stage_latency["bm25"] = (time.perf_counter() - t1) * 1000
         bm25_ids = [it.id for it in bm25_res.items] if bm25_res else []
 
-        # ── Vector retrieval ──────────────────────────────────────────────────
         vec_ids: list[str] = []
         if self._has_vector and self._vector:
             t1 = time.perf_counter()
@@ -128,94 +166,162 @@ class MemoryCityRetriever:
             stage_latency["vector"] = (time.perf_counter() - t1) * 1000
             vec_ids = [it.id for it in vec_res.items]
 
-        # ── Community / README routing ────────────────────────────────────────
         community_ids: list[str] = []
-        if Route.COMMUNITY_GLOBAL in decision.routes and self._graph:
+        if (
+            self._enable_community
+            and not low_confidence
+            and Route.COMMUNITY_GLOBAL in decision.routes
+            and self._graph
+        ):
             t1 = time.perf_counter()
             community_ids = self._community_search(query, candidates)
             stage_latency["community"] = (time.perf_counter() - t1) * 1000
 
-        # ── Fuse rankings ─────────────────────────────────────────────────────
+        # ── Weighted fusion of lexical + vector (+ community routing) ──────────
+        weights = decision.weights if not low_confidence else {"lexical": 0.5, "vector": 0.5}
+        w_lex = weights.get("lexical", 0.5)
+        w_vec = weights.get("vector", 0.5)
+        w_com = weights.get("community", 0.5)
         t1 = time.perf_counter()
-        ranking_lists = [l for l in [bm25_ids, vec_ids, community_ids] if l]
-        if ranking_lists:
-            fused = compute_rrf(ranking_lists, k=self._rrf_k)
-            fused_ids = [doc_id for doc_id, _ in fused]
-        else:
-            fused_ids = bm25_ids or vec_ids
+        base_scores = self._weighted_rrf(
+            [(bm25_ids, w_lex), (vec_ids, w_vec), (community_ids, w_com)]
+        )
         stage_latency["fusion"] = (time.perf_counter() - t1) * 1000
 
-        # ── Graph expansion ───────────────────────────────────────────────────
-        if Route.LOCAL_GRAPH in decision.routes and self._graph:
+        # Snapshot: fused ranking of raw episodes before any graph/temporal stage.
+        pre_rerank = self._rank_episode_ids(base_scores)
+
+        scores = dict(base_scores)
+
+        # ── Graph expansion (supplement only) ─────────────────────────────────
+        graph_ids: list[str] = []
+        if (
+            self._enable_graph_expansion
+            and not low_confidence
+            and Route.LOCAL_GRAPH in decision.routes
+            and self._graph
+        ):
             t1 = time.perf_counter()
-            expanded = self._graph_expand(fused_ids[:top_k], max_extra=top_k)
-            # Add expanded to end if not already present
-            seen = set(fused_ids)
-            for eid in expanded:
-                if eid not in seen:
-                    fused_ids.append(eid)
-                    seen.add(eid)
+            seeds = [d for d, _ in sorted(base_scores.items(), key=lambda x: x[1], reverse=True)][:top_k]
+            graph_ids = self._graph_expand(seeds, max_extra=candidates)
+            min_base = min(base_scores.values(), default=0.0)
+            for rank, eid in enumerate(graph_ids):
+                if eid in scores:
+                    continue
+                # Supplement below the weakest genuine hit; never evicts one.
+                scores[eid] = (min_base * _GRAPH_SUPPLEMENT_SCALE) / (1 + rank)
             stage_latency["graph_expand"] = (time.perf_counter() - t1) * 1000
 
-        # ── Temporal filtering ────────────────────────────────────────────────
-        if Route.TEMPORAL in decision.routes:
+        pre_temporal = self._rank_episode_ids(scores)
+
+        # ── Temporal nudge (additive, never a hard re-sort) ───────────────────
+        if (
+            self._enable_temporal
+            and not low_confidence
+            and Route.TEMPORAL in decision.routes
+        ):
             t1 = time.perf_counter()
-            fused_ids = self._temporal_filter(fused_ids, query)
+            scores = self._temporal_nudge(scores, query)
             stage_latency["temporal"] = (time.perf_counter() - t1) * 1000
+        post_temporal = self._rank_episode_ids(scores)
 
-        # ── Provenance reranking ──────────────────────────────────────────────
-        t1 = time.perf_counter()
-        fused_ids = self._provenance_rerank(fused_ids)
-        stage_latency["provenance_rerank"] = (time.perf_counter() - t1) * 1000
+        # ── Provenance nudge (additive) ───────────────────────────────────────
+        pre_provenance = post_temporal
+        if self._enable_provenance and not low_confidence:
+            t1 = time.perf_counter()
+            scores = self._provenance_nudge(scores)
+            stage_latency["provenance_rerank"] = (time.perf_counter() - t1) * 1000
+        post_provenance = self._rank_episode_ids(scores)
 
-        # ── Assemble results ──────────────────────────────────────────────────
+        # ── Assemble raw-episode results, deduped by source episode ───────────
         id_to_corpus: dict[str, dict] = {it["id"]: it for it in self._corpus}
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         items: list[RetrievedItem] = []
-        score_map = {doc_id: score for doc_id, score in (
-            compute_rrf(ranking_lists, k=self._rrf_k) if ranking_lists else []
-        )}
-        for doc_id in fused_ids[:top_k]:
-            it = id_to_corpus.get(doc_id)
-            if it:
-                score = score_map.get(doc_id, 0.0)
-                items.append(_make_retrieved(it, score))
+        seen_sources: set[str] = set()
+        for doc_id, score in ranked:
+            corpus_item = id_to_corpus.get(doc_id)
+            if corpus_item is None:
+                continue  # README/hub/community nodes never become final evidence
+            src = corpus_item.get("source_episode_ids") or [doc_id]
+            canonical = src[0]
+            if canonical in seen_sources:
+                continue
+            seen_sources.add(canonical)
+            items.append(_make_retrieved(corpus_item, score))
+            if len(items) >= top_k:
+                break
 
         total_latency = (time.perf_counter() - t0) * 1000
 
         retrieval_trace: RetrievalTrace | None = None
         if trace:
+            union = self._rank_episode_ids(scores)
             retrieval_trace = RetrievalTrace(
                 query=query,
                 routes=[r.value for r in decision.routes],
                 features=decision.features,
-                weights=decision.weights,
-                candidate_count_before=len(fused_ids),
+                weights=weights,
+                candidate_count_before=len(scores),
                 candidate_count_after=len(items),
                 stage_latency_ms=stage_latency,
                 total_latency_ms=total_latency,
+                bm25_candidates=bm25_ids,
+                vector_candidates=vec_ids,
+                graph_candidates=graph_ids,
+                community_candidates=community_ids,
+                union_candidates=union,
+                pre_rerank=pre_rerank,
+                post_rerank=[it.id for it in items],
+                metadata={
+                    "confidence": decision.confidence,
+                    "low_confidence_fallback": low_confidence,
+                    "pre_temporal": pre_temporal,
+                    "post_temporal": post_temporal,
+                    "pre_provenance": pre_provenance,
+                    "post_provenance": post_provenance,
+                },
             )
 
         return RetrievalResult(
             query=query, items=items, top_k=top_k,
-            latency_ms=total_latency,
-            trace=retrieval_trace,
+            latency_ms=total_latency, trace=retrieval_trace,
         )
 
+    def _weighted_rrf(self, lists: list[tuple[list[str], float]]) -> dict[str, float]:
+        """Weighted Reciprocal Rank Fusion.
+
+        Each ranked list contributes ``weight / (rrf_k + rank)`` per document.
+        This is where coordinator weights actually influence the score, rather
+        than being logged and ignored.
+        """
+        scores: dict[str, float] = {}
+        for ranked, weight in lists:
+            if not ranked or weight <= 0:
+                continue
+            for rank, doc_id in enumerate(ranked, 1):
+                scores[doc_id] = scores.get(doc_id, 0.0) + weight / (self._rrf_k + rank)
+        return scores
+
+    def _rank_episode_ids(self, scores: dict[str, float]) -> list[str]:
+        """Return corpus (raw-episode) ids ranked by score, dropping graph-only nodes."""
+        corpus_ids = {it["id"] for it in self._corpus}
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [doc_id for doc_id, _ in ranked if doc_id in corpus_ids]
+
     def _community_search(self, query: str, top_k: int) -> list[str]:
-        """Find episode IDs via community README matching."""
+        """Route to raw episode ids via community README term overlap."""
         if not self._graph:
             return []
         query_tokens = set(tokenize(query))
         scored: list[tuple[float, str]] = []
-        for nid, data in self._graph.nodes(data=True):
+        for _, data in self._graph.nodes(data=True):
             if data.get("node_type") != NodeType.COMMUNITY.value:
                 continue
             readme = data.get("metadata", {}).get("readme", {})
             terms = set(readme.get("top_terms", []) + readme.get("top_entities", []))
             overlap = len(query_tokens & terms) / (len(terms) + 1)
             if overlap > 0:
-                member_eps = readme.get("source_episode_ids", [])
-                for ep_id in member_eps[:top_k]:
+                for ep_id in readme.get("source_episode_ids", [])[:top_k]:
                     scored.append((overlap, ep_id))
         scored.sort(reverse=True)
         seen: set[str] = set()
@@ -227,61 +333,79 @@ class MemoryCityRetriever:
         return result[:top_k]
 
     def _graph_expand(self, seed_ids: list[str], max_extra: int) -> list[str]:
-        """BFS expand from seed episode nodes up to hop_limit."""
+        """BFS from seed episode nodes up to hop_limit, returning episode ids only."""
         if not self._graph:
             return []
         visited: set[str] = set(seed_ids)
         frontier: list[str] = list(seed_ids)
         result: list[str] = []
-
         for _ in range(self._hop_limit):
             next_frontier: list[str] = []
             for nid in frontier:
                 if not self._graph.has_node(nid):
                     continue
-                for nbr in list(self._graph.successors(nid)) + list(self._graph.predecessors(nid)):
-                    if nbr not in visited:
-                        visited.add(nbr)
-                        ntype = self._graph.nodes[nbr].get("node_type", "")
-                        if ntype == NodeType.EPISODE.value:
-                            result.append(nbr)
-                        next_frontier.append(nbr)
-                        if len(result) >= max_extra:
-                            return result
+                neighbours = list(self._graph.successors(nid)) + list(
+                    self._graph.predecessors(nid)
+                )
+                for nbr in neighbours:
+                    if nbr in visited:
+                        continue
+                    visited.add(nbr)
+                    if self._graph.nodes[nbr].get("node_type") == NodeType.EPISODE.value:
+                        result.append(nbr)
+                    next_frontier.append(nbr)
+                    if len(result) >= max_extra:
+                        return result
             frontier = next_frontier
         return result[:max_extra]
 
-    def _temporal_filter(self, ids: list[str], query: str) -> list[str]:
-        """Sort episodes with temporal keywords: prefer newer unless 'originally/before' query."""
-        if not self._graph:
-            return ids
+    def _temporal_nudge(self, scores: dict[str, float], query: str) -> dict[str, float]:
+        """Add a small recency (or antiquity) bonus without reordering by time.
+
+        The bonus is bounded by ``_TEMPORAL_NUDGE`` times the current max score, so
+        it can break ties and gently reorder near-equal candidates but cannot
+        overturn a decisively stronger lexical/vector hit.
+        """
+        if not self._graph or not scores:
+            return scores
         q_lower = query.lower()
-        prefer_old = any(kw in q_lower for kw in ("originally", "before", "used to", "was", "old"))
-
-        id_to_ts: dict[str, float] = {}
-        for nid in ids:
+        prefer_old = any(
+            kw in q_lower for kw in ("originally", "before", "used to", "first", "old")
+        )
+        timestamps: dict[str, float] = {}
+        for nid in scores:
             if self._graph.has_node(nid):
-                id_to_ts[nid] = self._graph.nodes[nid].get("timestamp", 0.0)
-            else:
-                id_to_ts[nid] = 0.0
+                timestamps[nid] = self._graph.nodes[nid].get("timestamp", 0.0)
+        if not timestamps:
+            return scores
+        lo, hi = min(timestamps.values()), max(timestamps.values())
+        span = (hi - lo) or 1.0
+        max_score = max(scores.values()) or 1.0
+        nudged = dict(scores)
+        for nid, ts in timestamps.items():
+            frac = (ts - lo) / span  # 0 oldest … 1 newest
+            if prefer_old:
+                frac = 1.0 - frac
+            nudged[nid] += _TEMPORAL_NUDGE * max_score * frac
+        return nudged
 
-        return sorted(ids, key=lambda nid: id_to_ts.get(nid, 0.0), reverse=not prefer_old)
+    def _provenance_nudge(self, scores: dict[str, float]) -> dict[str, float]:
+        """Add a bonus proportional to *extra* provenance beyond a single episode.
 
-    def _provenance_rerank(self, ids: list[str]) -> list[str]:
-        """Boost items that have richer provenance (more source_episode_ids)."""
-        if not self._graph:
-            return ids
-        scored: list[tuple[float, str]] = []
-        for rank, nid in enumerate(ids):
-            base_score = 1.0 / (1 + rank)
-            if self._graph.has_node(nid):
-                ep_count = len(self._graph.nodes[nid].get("source_episode_ids", []))
-                boost = ep_count * self._prov_boost
-            else:
-                boost = 0.0
-            scored.append((base_score + boost, nid))
-        scored.sort(reverse=True)
-        return [nid for _, nid in scored]
+        A plain episode with one source contributes zero here (the old code gave
+        every candidate the same boost, which just preserved order). Only nodes
+        that genuinely aggregate multiple source episodes get lifted.
+        """
+        if not self._graph or not scores:
+            return scores
+        nudged = dict(scores)
+        for nid in scores:
+            if not self._graph.has_node(nid):
+                continue
+            extra = len(self._graph.nodes[nid].get("source_episode_ids", [])) - 1
+            if extra > 0:
+                nudged[nid] += extra * self._prov_boost
+        return nudged
 
     def close(self) -> None:
         if self._store:

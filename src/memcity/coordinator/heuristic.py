@@ -32,18 +32,30 @@ GLOBAL_PATTERNS = re.compile(
 
 ENTITY_RE = re.compile(r"\b[A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?\b")
 
+# Sentence-initial question/auxiliary words that ENTITY_RE would otherwise
+# misread as proper-noun entities (e.g. "What did Caroline buy?" → "What").
+QUESTION_WORDS = frozenset(
+    {
+        "What", "Who", "Where", "When", "Why", "How", "Which",
+        "Can", "Is", "Are", "Do", "Does", "Did", "Was", "Were",
+        "Tell", "Amid", "Any", "Could", "Would", "Should", "Will",
+    }
+)
+
 
 @dataclass
 class CoordinatorDecision:
     routes: list[Route] = field(default_factory=list)
     features: dict[str, Any] = field(default_factory=dict)
     weights: dict[str, float] = field(default_factory=dict)
+    confidence: float = 0.5
 
     def to_dict(self) -> dict:
         return {
             "routes": [r.value for r in self.routes],
             "features": self.features,
             "weights": self.weights,
+            "confidence": self.confidence,
         }
 
 
@@ -63,7 +75,7 @@ class Coordinator:
             "Tell", "Amid", "Any"))
         has_temporal = bool(TEMPORAL_PATTERNS.search(q))
         has_global = bool(GLOBAL_PATTERNS.search(q))
-        entities = ENTITY_RE.findall(q)
+        entities = [e for e in ENTITY_RE.findall(q) if e not in QUESTION_WORDS]
         is_short = n_tokens <= 6
 
         features = {
@@ -106,4 +118,22 @@ class Coordinator:
         if Route.VECTOR not in routes and Route.HYBRID not in routes:
             routes.append(Route.VECTOR)
 
-        return CoordinatorDecision(routes=routes, features=features, weights=weights)
+        # Confidence reflects how much positive routing signal the query carries.
+        # A bare query with no entities / temporal / global cue is low-confidence:
+        # the retriever should fall back to plain Hybrid RRF rather than trust a
+        # weakly-motivated graph/temporal route.
+        signal = 0.0
+        if entities:
+            signal += min(0.4, 0.2 * len(entities))
+        if has_temporal:
+            signal += 0.2
+        if has_global:
+            signal += 0.2
+        if has_upper:
+            signal += 0.1
+        confidence = min(1.0, 0.3 + signal)
+        features["confidence"] = confidence
+
+        return CoordinatorDecision(
+            routes=routes, features=features, weights=weights, confidence=confidence
+        )

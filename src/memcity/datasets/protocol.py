@@ -39,6 +39,7 @@ class QASample(BaseModel):
     query: str
     answer: str
     history: list[EpisodeTurn]
+    corpus_scope_id: str = ""
     evidence_episode_ids: list[str] = Field(default_factory=list)
     evidence_node_ids: list[str] = Field(default_factory=list)
     category: QuestionCategory = QuestionCategory.DIRECT_FACT

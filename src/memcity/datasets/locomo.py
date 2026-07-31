@@ -90,6 +90,7 @@ class LoCoMoDataset(BaseDataset):
                         query=str(qa.get("question", "")),
                         answer=str(qa.get("answer", "")),
                         history=history,
+                        corpus_scope_id=f"locomo:{conversation_id}",
                         evidence_episode_ids=evidence_ids,
                         category=_CATEGORY_MAP.get(category_number, QuestionCategory.DIRECT_FACT),
                         required_evidence_count=len(evidence_ids),

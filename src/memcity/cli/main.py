@@ -255,13 +255,18 @@ def benchmark_retrieval(
     """Run retrieval benchmark across methods."""
     from memcity.datasets.loader import load_dataset
     from memcity.evaluation.runner import RetrievalBenchmarkRunner
-    from memcity.reporting.tables import print_category_table, print_retrieval_table
-    from memcity.retrieval.registry import get_retriever
+    from memcity.reporting.tables import (
+        print_category_table,
+        print_diagnostics_table,
+        print_evidence_loss_table,
+        print_retrieval_table,
+    )
+    from memcity.retrieval.registry import get_retriever_factory
 
     seed_val = int(seeds.split(",")[0])
-    _, samples = load_dataset(dataset, data_dir, seed=seed_val, limit=limit)
+    ds, samples = load_dataset(dataset, data_dir, seed=seed_val, limit=limit)
+    source_hash = ds.manifest().source_hash
 
-    corpus = _samples_to_corpus(samples)
     top_ks = tuple(int(k) for k in top_k.split(","))
     seed_list = [int(s) for s in seeds.split(",")]
     method_list = [m.strip() for m in methods.split(",")]
@@ -276,17 +281,22 @@ def benchmark_retrieval(
     all_results: list[dict] = []
     for method in method_list:
         try:
-            retriever = get_retriever(method)
+            factory = get_retriever_factory(method)
             console.print(f"\n[bold cyan]Running {method}…[/bold cyan]")
             result = runner.run(
-                retriever=retriever,
-                corpus=corpus,
+                retriever_factory=factory,
                 samples=samples,
                 dataset_name=dataset,
+                source_hash=source_hash,
             )
             result["method"] = method
             all_results.append(result)
-            retriever.close()
+            xsr = result.get("cross_scope_retrieval_rate", 0.0)
+            if xsr:
+                console.print(
+                    f"[red]cross_scope_retrieval_rate={xsr:.3f} for {method} "
+                    f"(should be 0 — scope leak!)[/red]"
+                )
         except Exception as exc:
             console.print(f"[red]Error in {method}: {exc}[/red]")
             import traceback
@@ -296,6 +306,23 @@ def benchmark_retrieval(
     if all_results:
         print_retrieval_table(all_results, dataset_name=dataset, n_samples=len(samples))
         print_category_table(all_results, dataset_name=dataset)
+        print_diagnostics_table(all_results, dataset_name=dataset)
+
+        # Worst-20 evidence-loss table for the richest method available.
+        loss_method = next(
+            (m for m in ("memory_city_full", "hybrid_graph", "hybrid_temporal") if m in method_list),
+            None,
+        )
+        if loss_method:
+            loss_result = next(r for r in all_results if r["method"] == loss_method)
+            rid = loss_result.get("run_id")
+            seed0 = seed_list[0]
+            pq_path = Path(output_dir) / rid / f"per_query_metrics_{seed0}.jsonl"
+            if pq_path.exists():
+                per_query = [
+                    json.loads(line) for line in pq_path.read_text(encoding="utf-8").splitlines() if line
+                ]
+                print_evidence_loss_table(per_query, method=loss_method)
 
 
 @benchmark_app.command("ablation")
@@ -307,18 +334,26 @@ def benchmark_ablation(
     data_dir: str = typer.Option("data", "--data-dir"),
     output_dir: str = typer.Option("runs", "--output"),
 ) -> None:
-    """Run ablation study for Memory City."""
-    console.print("[bold]Ablation study[/bold] — comparing component contributions.")
-    ablation_methods = [
-        "bm25",
-        "vector",
-        "hybrid_rrf",
-        "memory_city_full",
-    ]
-    # Invoke retrieval benchmark with ablation methods
+    """Run a real ablation ladder for Memory City.
+
+    Each variant toggles exactly one component so the delta between adjacent
+    rows attributes gain/loss to that component. ``--remove`` optionally drops
+    named variants from the ladder.
+    """
+    from memcity.retrieval.registry import ablation_methods as _ladder
+
+    console.print("[bold]Ablation study[/bold] — one component per step.")
+    ladder = _ladder()
+    removed = {r.strip() for r in remove.split(",") if r.strip()}
+    if removed:
+        ladder = [m for m in ladder if m not in removed]
+        console.print(f"[dim]Removed from ladder: {sorted(removed)}[/dim]")
+    if base and base not in ladder:
+        ladder.append(base)
+
     benchmark_retrieval(
         dataset=dataset,
-        methods=",".join(ablation_methods),
+        methods=",".join(ladder),
         top_k="1,3,5,10",
         seeds=seeds,
         warmup=3,

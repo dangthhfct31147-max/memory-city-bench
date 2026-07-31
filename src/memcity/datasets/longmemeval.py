@@ -128,6 +128,7 @@ class LongMemEvalDataset(BaseDataset):
             query=str(entry.get("question", "")),
             answer=str(entry.get("answer", "")),
             history=history,
+            corpus_scope_id=f"lme:{question_id}",
             evidence_episode_ids=evidence_ids,
             category=category,
             timestamp=_timestamp(str(entry.get("question_date", "")), 0.0),

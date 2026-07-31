@@ -27,6 +27,15 @@ class RetrievalTrace(BaseModel):
     stage_latency_ms: dict[str, float] = Field(default_factory=dict)
     total_latency_ms: float = 0.0
     metadata: dict[str, Any] = Field(default_factory=dict)
+    
+    bm25_candidates: list[str] = Field(default_factory=list)
+    vector_candidates: list[str] = Field(default_factory=list)
+    graph_candidates: list[str] = Field(default_factory=list)
+    community_candidates: list[str] = Field(default_factory=list)
+    union_candidates: list[str] = Field(default_factory=list)
+    pre_rerank: list[str] = Field(default_factory=list)
+    post_rerank: list[str] = Field(default_factory=list)
+    ground_truth_ranks: dict[str, int] = Field(default_factory=dict)
 
 
 class RetrievalResult(BaseModel):
