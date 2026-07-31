@@ -41,13 +41,19 @@ class RetrieverConfig(BaseModel):
 
 class ReaderConfig(BaseModel):
     provider: Literal["openai_compatible", "none"] = "none"
-    base_url: str = "http://127.0.0.1:8080/v1"
+    base_url: str = "http://localhost:20128/v1"
     model: str = "qwen3-0.6b"
     temperature: float = 0.0
     seed: int = 42
     max_tokens: int = 256
     context_token_budget: int = 4096
     timeout_s: float = 60.0
+    # Optional OmniRoute-style gateway settings. All opt-in; retrieval-only
+    # benchmarks ignore these entirely. The API key is never stored in config —
+    # only the name of the environment variable that holds it.
+    api_key_env: str = "MEMCITY_LLM_API_KEY"
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    disable_gateway_cache: bool = False
 
 
 class BenchmarkConfig(BaseModel):

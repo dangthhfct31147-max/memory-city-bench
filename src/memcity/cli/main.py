@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -370,8 +371,26 @@ def benchmark_e2e(
     reader_provider: str = typer.Option(
         "oracle", "--reader-provider", help="oracle | openai-compatible"
     ),
-    reader_base_url: str = typer.Option("http://127.0.0.1:8080/v1", "--reader-base-url"),
-    reader_model: str = typer.Option("qwen3-0.6b", "--reader-model"),
+    reader_base_url: str | None = typer.Option(
+        None, "--reader-base-url",
+        help="Gateway/base URL. Defaults to $MEMCITY_LLM_BASE_URL then localhost:20128.",
+    ),
+    reader_model: str | None = typer.Option(
+        None, "--reader-model",
+        help="Pinned model id. Defaults to $MEMCITY_LLM_MODEL. Pin explicitly for published runs.",
+    ),
+    reader_api_key_env: str = typer.Option(
+        "MEMCITY_LLM_API_KEY", "--reader-api-key-env",
+        help="Name of the env var holding the API key. The key value is never logged or stored.",
+    ),
+    reader_extra_header: list[str] = typer.Option(
+        [], "--reader-extra-header",
+        help="Extra request header as 'Name: Value'. Repeatable.",
+    ),
+    reader_disable_gateway_cache: bool = typer.Option(
+        False, "--reader-disable-gateway-cache",
+        help="Send X-OmniRoute-No-Cache: true so the gateway does not serve a cached generation.",
+    ),
     context_token_budget: int = typer.Option(4096, "--context-token-budget"),
     top_k: int = typer.Option(5, "--top-k"),
     limit: int | None = typer.Option(None, "--limit"),
@@ -390,7 +409,12 @@ def benchmark_e2e(
     from memcity.datasets.loader import load_dataset
     from memcity.evaluation.e2e_metrics import compute_e2e_metrics
     from memcity.instrumentation.resources import collect_environment, get_vram_mb
-    from memcity.readers.reader import OpenAICompatibleReader, OracleReader
+    from memcity.readers.reader import (
+        ENV_BASE_URL,
+        ENV_MODEL,
+        OpenAICompatibleReader,
+        OracleReader,
+    )
     from memcity.retrieval.registry import get_retriever_factory
     from memcity.utils.helpers import run_id as make_run_id
     from memcity.utils.helpers import write_jsonl
@@ -398,6 +422,20 @@ def benchmark_e2e(
     _, samples = load_dataset(dataset, data_dir, seed=seed, limit=limit)
 
     retriever_list = [r.strip() for r in retrievers.split(",")]
+
+    # Resolve gateway config; the api key is read from the environment only and
+    # never printed, echoed, or written to any run artifact.
+    effective_base_url = reader_base_url or os.environ.get(ENV_BASE_URL) or "http://localhost:20128/v1"
+    effective_model = reader_model or os.environ.get(ENV_MODEL)
+    api_key = os.environ.get(reader_api_key_env)
+
+    extra_headers: dict[str, str] = {}
+    for raw_header in reader_extra_header:
+        if ":" not in raw_header:
+            console.print(f"[red]Invalid --reader-extra-header (expected 'Name: Value'): {raw_header}[/red]")
+            raise typer.Exit(1)
+        name, _, value = raw_header.partition(":")
+        extra_headers[name.strip()] = value.strip()
 
     if reader_provider in ("oracle", "none"):
         reader = OracleReader()
@@ -407,13 +445,42 @@ def benchmark_e2e(
             "Pass --reader-provider openai-compatible for a real reader.[/yellow]"
         )
     elif reader_provider == "openai-compatible":
+        if not effective_model:
+            console.print(
+                "[red]No model pinned. Set --reader-model or $MEMCITY_LLM_MODEL to an "
+                "explicit model id for reproducible runs.[/red]"
+            )
+            raise typer.Exit(1)
+        # Benchmark runs always bypass the gateway's own response cache so a
+        # stale generation is never scored (requirement #6). The
+        # --reader-disable-gateway-cache flag makes that intent explicit; the
+        # header is sent regardless for benchmark correctness. Local per-run
+        # caching (cache_path) is unaffected and still deduplicates identical
+        # prompts within a run.
         reader = OpenAICompatibleReader(
-            base_url=reader_base_url,
-            model=reader_model,
+            base_url=effective_base_url,
+            model=effective_model,
             context_token_budget=context_token_budget,
             cache_path=Path(data_dir) / "reader_cache.jsonl",
+            api_key=api_key,
+            extra_headers=extra_headers,
+            gateway_no_cache=True,
         )
         use_oracle = False
+        # Report auth/endpoint status without ever printing the key.
+        console.print(
+            f"[dim]Reader endpoint: {effective_base_url} | model: {effective_model} | "
+            f"auth: {'yes' if api_key else 'no'} | "
+            f"env var: {reader_api_key_env}[/dim]"
+        )
+        health = reader.health_check()
+        if not health["ok"]:
+            console.print(f"[yellow]Health check failed (continuing): {health['error']}[/yellow]")
+        elif not health["model_available"]:
+            console.print(
+                f"[yellow]Pinned model '{effective_model}' not in gateway /models list "
+                f"({len(health['models'])} available). Fallback may occur.[/yellow]"
+            )
     else:
         console.print(f"[red]Unknown reader provider: {reader_provider}[/red]")
         raise typer.Exit(1)
@@ -504,10 +571,33 @@ def benchmark_e2e(
         metrics["retriever"] = method
         metrics["dataset"] = dataset
         metrics["reader_provider"] = reader_provider
-        metrics["reader_model"] = reader_model if not use_oracle else "oracle"
+        metrics["reader_model"] = (effective_model if not use_oracle else "oracle") or "oracle"
         metrics["context_token_budget"] = context_token_budget
         metrics["top_k"] = top_k
         metrics["peak_vram_mb"] = max(vram_samples_list) if vram_samples_list else 0.0
+
+        # Reproducibility auditing: record requested vs. effective model/provider
+        # and surface any gateway fallback as a run-level warning.
+        if not use_oracle:
+            observed_models = sorted({
+                rr.get("effective_model", "") for rr in reader_results
+                if rr.get("effective_model")
+            })
+            observed_providers = sorted({
+                rr.get("effective_provider", "") for rr in reader_results
+                if rr.get("effective_provider")
+            })
+            fallback_count = sum(1 for rr in reader_results if rr.get("fallback_warning"))
+            metrics["requested_model"] = effective_model
+            metrics["effective_models_observed"] = observed_models
+            metrics["effective_providers_observed"] = observed_providers
+            metrics["fallback_warning_count"] = fallback_count
+            if fallback_count:
+                console.print(
+                    f"[yellow]WARNING: {fallback_count}/{len(reader_results)} responses came "
+                    f"from a model other than the pinned '{effective_model}'. Do not publish "
+                    f"this as a pinned-model benchmark run. Observed: {observed_models}[/yellow]"
+                )
         all_tables.append(metrics)
 
         rid = make_run_id()
@@ -523,13 +613,20 @@ def benchmark_e2e(
                     "dataset": dataset,
                     "retriever": method,
                     "reader_provider": reader_provider,
-                    "reader_base_url": reader_base_url,
-                    "reader_model": reader_model,
+                    "reader_base_url": effective_base_url,
+                    "reader_model": effective_model,
                     "context_token_budget": context_token_budget,
                     "top_k": top_k,
                     "limit": limit,
                     "seed": seed,
                     "scope_count": len(scope_corpora),
+                    # OmniRoute config recorded WITHOUT the secret: only the env
+                    # var name, whether auth was enabled, the header names, and
+                    # the no-cache flag are persisted.
+                    "reader_api_key_env": reader_api_key_env,
+                    "reader_auth_enabled": bool(api_key) if not use_oracle else False,
+                    "reader_extra_header_names": sorted(extra_headers.keys()),
+                    "reader_disable_gateway_cache": reader_disable_gateway_cache,
                 },
                 indent=2,
             ),

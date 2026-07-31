@@ -19,6 +19,13 @@ retriever:
 
 reader:
   provider: none
+  # Optional OmniRoute-style gateway (only used when provider: openai_compatible).
+  # base_url and model default to $MEMCITY_LLM_BASE_URL / $MEMCITY_LLM_MODEL.
+  base_url: http://localhost:20128/v1
+  # api_key_env names the environment variable holding the key; the key value
+  # itself is never stored in config or run artifacts.
+  api_key_env: MEMCITY_LLM_API_KEY
+  disable_gateway_cache: false
 
 benchmark:
   dataset: synthetic-tiny
