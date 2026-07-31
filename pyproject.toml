@@ -1,0 +1,75 @@
+[project]
+name = "memory-city-bench"
+version = "0.1.0"
+description = "Memory City Benchmark - CLI for evaluating long-term AI memory retrieval architectures"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Memory City Bench Contributors" }]
+keywords = ["retrieval", "benchmark", "memory", "knowledge-graph", "rag"]
+
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "rank-bm25>=0.2.2",
+    "scikit-learn>=1.4",
+    "networkx>=3.2",
+    "psutil>=5.9",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+embeddings = ["sentence-transformers>=2.6"]
+vector = ["hnswlib>=0.8"]
+ann = ["hnswlib>=0.8"]
+gpu = ["nvidia-ml-py>=13.0"]
+nlp = [
+    "spacy>=3.7",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
+readers = ["httpx>=0.27"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "mypy>=1.9",
+]
+
+[project.scripts]
+memcity = "memcity.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memcity"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+ignore = ["E501", "B008"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = false
+no_implicit_optional = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "integration: integration tests",
+    "smoke: end-to-end smoke tests",
+    "slow: slow tests requiring optional deps",
+]

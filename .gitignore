@@ -1,0 +1,16 @@
+.venv/
+venv/
+.uv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Downloaded benchmark corpora, model/cache data, and generated run artifacts.
+data/raw/
+data/longmemeval/
+data/locomo/
+data/synthetic/
+data/reader_cache.jsonl
+runs/
