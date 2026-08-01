@@ -16,6 +16,64 @@ retriever:
   rrf_k: 60
   graph_hop_limit: 2
   coordinator_enabled: true
+  # Graph propagation: bfs (flat) | weighted (edge-type + hop decay) | ppr
+  # (Personalized PageRank seeded on fused hits). Use methods hybrid_graph /
+  # hybrid_graph_weighted / hybrid_ppr to exercise each in ablation.
+  graph_mode: bfs
+  degree_penalty: false
+  max_graph_contribution_per_episode: 1.0
+
+temporal:
+  # Bi-temporal fact layer. When enable_facts is true the builder emits FactNodes
+  # with valid_from/valid_to and SUPERSEDES/CONTRADICTS edges; temporal queries
+  # resolve against event time. Use method hybrid_temporal_kg to exercise it.
+  enabled: false
+  enable_facts: false
+  fact_extractor: regex
+
+contextual_index:
+  # Prepend a short context prefix to each episode before indexing so context-poor
+  # turns ("Yes, let's use that one.") become retrievable. The prefix only feeds
+  # the index; RetrievedItem.text stays raw for provenance/citations.
+  # mode: raw (off) | deterministic (session/prev-turn/timestamp, no LLM) | llm.
+  mode: raw
+  max_context_tokens: 100
+
+hierarchical:
+  # Hierarchical summary tier (RAPTOR-style, extractive, no LLM). When enabled the
+  # builder condenses each session into a SUMMARY node (top TF-IDF sentences) and
+  # optionally stacks further tiers up to a root; global/overview queries descend
+  # the tree to the raw episodes beneath the best-matching summaries. Summaries
+  # only route — they never become final evidence. Use method `hybrid_tree`.
+  enabled: false
+  max_levels: 1
+  summary_max_sentences: 3
+  branching_factor: 5
+  summary_extractor: tfidf
+
+compression:
+  # Deterministic evidence compression before the reader (Phase 7; no LLM).
+  # Keeps only high-signal sentences per retrieved passage — query overlap, named
+  # entities, numbers/dates, negations — preserving citation ids and ordering.
+  # Trades reader tokens/latency for a small coverage risk; the e2e run records
+  # compression_ratio and answer_token_coverage. Enable via `--compress-evidence`.
+  enabled: false
+  max_sentences_per_passage: 3
+  keep_numeric: true
+  keep_entities: true
+  keep_negations: true
+  min_query_overlap: 1
+
+rerank:
+  # Cross-encoder reranker (optional; needs extra `embeddings`). When disabled or
+  # the extra is missing, the pipeline is a pass-through and metrics are
+  # unaffected. Use methods `rerank_hybrid` / `rerank_memory_city` to enable it.
+  enabled: false
+  model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
+  candidate_k: 50
+  rerank_k: 30
+  final_k: 10
+  device: cpu
 
 reader:
   provider: none
@@ -34,6 +92,13 @@ reader:
   # Optional OmniRoute provider id; routes chat to
   # /v1/providers/<id>/chat/completions (errors instead of falling back).
   omniroute_provider: null
+  # Phase 5: capture KV/prefix-cache timing fields from the backend's usage
+  # object. When enabled, prompt_eval_ms / decode_ms / cached_prompt_tokens
+  # are recorded per call and aggregated in e2e metrics.json.
+  capture_cache_metrics: true
+  # Place the static system prompt first so KV-cache-aware backends can reuse
+  # the prompt prefix across queries within a run.
+  prompt_prefix_stable_order: true
 
 benchmark:
   dataset: synthetic-tiny

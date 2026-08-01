@@ -34,6 +34,11 @@ class EpisodeTurn(BaseModel):
     user_text: str
     assistant_text: str
     timestamp: float
+    # System-time axis (Phase 3). ``observed_at`` is when the turn was uttered
+    # (defaults to ``timestamp`` when unset); ``ingested_at`` is when the harness
+    # indexed it. Both are optional so existing datasets remain valid.
+    observed_at: float | None = None
+    ingested_at: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

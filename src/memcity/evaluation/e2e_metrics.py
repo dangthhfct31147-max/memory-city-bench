@@ -57,6 +57,13 @@ def compute_e2e_metrics(
     schema_total = 0
     latency_vals: list[float] = []
     prompt_tokens_total = completion_tokens_total = 0
+    # Phase 5: KV/prefix-cache timing lists (only include queries where the
+    # backend actually reported the value — None means "not reported", not 0).
+    prompt_eval_ms_vals: list[float] = []
+    decode_ms_vals: list[float] = []
+    cached_tokens_vals: list[int] = []
+    cache_hit_count = 0
+    cache_reported_count = 0
     n = len(results)
 
     by_category: dict[str, list[float]] = defaultdict(list)
@@ -94,6 +101,23 @@ def compute_e2e_metrics(
         latency_vals.append(res.get("latency_ms", 0.0))
         prompt_tokens_total += res.get("prompt_tokens", 0)
         completion_tokens_total += res.get("completion_tokens", 0)
+
+        # Phase 5: split prefill (prompt eval) vs decode timing, and prefix-cache
+        # hits. None means the backend did not report it — never coerce to 0.
+        prompt_eval_ms = res.get("prompt_eval_ms")
+        if prompt_eval_ms is not None:
+            prompt_eval_ms_vals.append(prompt_eval_ms)
+        decode_ms = res.get("decode_ms")
+        if decode_ms is not None:
+            decode_ms_vals.append(decode_ms)
+        cached_tokens = res.get("cached_prompt_tokens")
+        if cached_tokens is not None:
+            cached_tokens_vals.append(cached_tokens)
+        prefix_hit = res.get("prefix_cache_hit")
+        if prefix_hit is not None:
+            cache_reported_count += 1
+            if prefix_hit:
+                cache_hit_count += 1
 
         if not answer_obj:
             em_vals.append(0.0)
@@ -192,6 +216,24 @@ def compute_e2e_metrics(
         "completion_tokens_total": float(completion_tokens_total),
         "n_samples": float(n),
     }
+
+    # Phase 5: KV/prefix-cache timing. Reported separately from the blended
+    # reader_latency so cold prefill, warm prefill (KV-cache hit), and decode are
+    # never averaged into one number. Keys are omitted when the backend reported
+    # nothing, so a downstream reader can distinguish "unknown" from "zero".
+    if prompt_eval_ms_vals:
+        metrics["prompt_eval_ms_mean"] = _avg(prompt_eval_ms_vals)
+        metrics["prompt_eval_ms_p50"] = _pct_rank(sorted(prompt_eval_ms_vals), 0.5)
+    if decode_ms_vals:
+        metrics["decode_ms_mean"] = _avg(decode_ms_vals)
+        metrics["decode_ms_p50"] = _pct_rank(sorted(decode_ms_vals), 0.5)
+    if cached_tokens_vals:
+        metrics["cached_prompt_tokens_mean"] = _avg(
+            [float(v) for v in cached_tokens_vals]
+        )
+    if cache_reported_count:
+        metrics["prefix_cache_hit_rate"] = _pct(cache_hit_count, cache_reported_count)
+        metrics["prefix_cache_reported_rate"] = _pct(cache_reported_count, n)
 
     # Per-category exact match
     for cat, vals in by_category.items():

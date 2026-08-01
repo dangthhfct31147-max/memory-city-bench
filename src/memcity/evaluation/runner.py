@@ -11,10 +11,16 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from memcity.datasets.corpus import build_scope_corpus, group_samples_by_scope, scope_of
+from memcity.datasets.corpus import (
+    apply_contextual_index,
+    build_scope_corpus,
+    group_samples_by_scope,
+    scope_of,
+)
 from memcity.datasets.protocol import QASample
 from memcity.evaluation.diagnostics import compute_diagnostics
 from memcity.evaluation.metrics import aggregate_metrics, compute_all_metrics
@@ -58,7 +64,7 @@ def dataset_hash(samples: list[QASample], *, source_hash: str = "", extra: dict 
         for ep in sample.history:
             digest.update(ep.episode_id.encode("utf-8"))
             digest.update(b"\1")
-            digest.update((f"{ep.user_text} {ep.assistant_text}").encode("utf-8"))
+            digest.update((f"{ep.user_text} {ep.assistant_text}").encode())
             digest.update(b"\2")
         digest.update(b"\n")
     return digest.hexdigest()
@@ -171,6 +177,15 @@ class RetrievalBenchmarkRunner:
     ) -> dict:
         scope_corpora = build_scope_corpus(samples)
         scoped_samples = group_samples_by_scope(samples)
+
+        # Phase 4: contextual indexing. Prefixes only ever feed the index; the raw
+        # episode text is preserved so evidence and citations are unaffected.
+        ctx = getattr(config, "contextual_index", None)
+        ctx_mode = getattr(ctx, "mode", "raw")
+        if ctx_mode != "raw":
+            ctx_tokens = getattr(ctx, "max_context_tokens", 100)
+            for corpus in scope_corpora.values():
+                apply_contextual_index(corpus, mode=ctx_mode, max_context_tokens=ctx_tokens)
 
         latency_stats = LatencyStats()
         per_query_metrics: list[dict] = []

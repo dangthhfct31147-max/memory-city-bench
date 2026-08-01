@@ -87,6 +87,29 @@ class ReaderResult(BaseModel):
     cache_hit: bool = False
     upstream_latency_ms: float = 0.0
     local_lookup_latency_ms: float = 0.0
+    # ── Phase 5: KV / prefix-cache metrics ────────────────────────────────────
+    # All fields are "unknown" (None) when the backend does not return the data,
+    # so callers must never assume 0 means "no cache hit" vs "not reported".
+    # prompt_eval_ms  — time the backend spent processing the prompt tokens
+    #                   (cold = full prefill, warm ≈ 0 on a KV-cache hit).
+    # decode_ms       — time the backend spent generating completion tokens.
+    # cached_prompt_tokens — tokens served from the KV cache (OpenAI: usage
+    #                        .prompt_tokens_details.cached_tokens; llama.cpp:
+    #                        timings.prompt_n_cached or similar).
+    # prefix_cache_hit — True when cached_prompt_tokens > 0, False when 0 and
+    #                    reported, None when not reported by the backend.
+    reader_backend: str = ""
+    prefix_cache_enabled: bool | None = None
+    prefix_cache_hit: bool | None = None
+    cached_prompt_tokens: int | None = None
+    prompt_eval_ms: float | None = None
+    decode_ms: float | None = None
+    prompt_tokens_per_second: float | None = None
+    generation_tokens_per_second: float | None = None
+    # SHA-256 (hex) of the stable prompt prefix (system prompt + schema +
+    # instructions). Identical across queries of the same run; enables auditing
+    # that the prefix was not changed mid-run.
+    prompt_prefix_hash: str = ""
 
 
 # ── Cache ──────────────────────────────────────────────────────────────────────
@@ -153,6 +176,10 @@ def header_config_hash(
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
+# Stable prefix: system instructions + JSON schema.  These sections are fixed
+# for the lifetime of a run and are placed first so backends with KV-cache
+# reuse can cache them across queries.  The prefix hash lets us audit that no
+# part of this section changed mid-run.
 _SYSTEM_PROMPT = """\
 You are a precise evidence-based answering system.
 Rules:
@@ -164,9 +191,18 @@ Rules:
    {"answer": "...", "evidence_ids": ["ep-..."], "abstained": false, "confidence": 0.0}
 """
 
+# SHA-256 of the stable prefix, computed once at import time.
+PROMPT_PREFIX_HASH: str = hashlib.sha256(_SYSTEM_PROMPT.encode()).hexdigest()
+
 
 def build_prompt(query: str, evidence: list[dict], token_budget: int) -> str:
-    """Build a prompt string staying within token_budget (approximate)."""
+    """Build a prompt string staying within token_budget (approximate).
+
+    Section order is stable for KV-cache reuse:
+      1. System instructions + schema  (stable — same hash every run)
+      2. Evidence passages             (variable per query)
+      3. Question                      (variable per query)
+    """
     # A conservative word-to-token estimate avoids overflowing small local contexts.
     approx_tokens = int(len(query.split()) * 1.5) + 250
     passages: list[str] = []
@@ -186,6 +222,85 @@ def build_prompt(query: str, evidence: list[dict], token_budget: int) -> str:
 
     evidence_block = "\n".join(passages) if passages else "(no evidence provided)"
     return f"{_SYSTEM_PROMPT}\n\nEVIDENCE:\n{evidence_block}\n\nQUESTION: {query}\n\nJSON ANSWER:"
+
+
+def _extract_cache_metrics(usage: dict) -> dict[str, int | float | bool | None]:
+    """Parse backend-specific KV/prefix-cache fields from the ``usage`` object.
+
+    Returns a dict with keys: ``cached_prompt_tokens``, ``prompt_eval_ms``,
+    ``decode_ms``, ``prompt_tokens_per_second``, ``generation_tokens_per_second``,
+    ``prefix_cache_hit``.  All values are None when the backend did not report
+    them; callers MUST NOT treat None as zero.
+
+    Supported backends:
+    * OpenAI-compatible (``usage.prompt_tokens_details.cached_tokens``)
+    * llama.cpp HTTP server (``usage.timings.*``)
+    """
+    cached: int | None = None
+    prompt_eval_ms: float | None = None
+    decode_ms_val: float | None = None
+    prompt_tps: float | None = None
+    gen_tps: float | None = None
+
+    # OpenAI-style: usage.prompt_tokens_details.cached_tokens
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        raw = details.get("cached_tokens")
+        if raw is not None:
+            cached = int(raw)
+
+    # llama.cpp HTTP server: usage.timings (non-standard extension)
+    timings = usage.get("timings")
+    if isinstance(timings, dict):
+        # prompt_eval_ms / prompt_n_cached
+        # Prefer the first key; fall back to the alias only when first is absent.
+        p_ms = timings.get("prompt_ms")
+        if p_ms is None:
+            p_ms = timings.get("prompt_eval_ms")
+        if p_ms is not None:
+            prompt_eval_ms = float(p_ms)
+
+        p_cached = timings.get("prompt_n_cached")
+        if p_cached is None:
+            p_cached = timings.get("cached_tokens")
+        if p_cached is not None and cached is None:
+            cached = int(p_cached)
+
+        # decode / generation timing
+        d_ms = timings.get("predicted_ms")
+        if d_ms is None:
+            d_ms = timings.get("eval_ms")
+        if d_ms is not None:
+            decode_ms_val = float(d_ms)
+
+        # tokens/s
+        p_tps = timings.get("prompt_per_second")
+        if p_tps is None:
+            p_tps = timings.get("prompt_tps")
+        if p_tps is not None:
+            prompt_tps = float(p_tps)
+
+        g_tps = timings.get("predicted_per_second")
+        if g_tps is None:
+            g_tps = timings.get("gen_tps")
+        if g_tps is not None:
+            gen_tps = float(g_tps)
+
+    # Derive prefix_cache_hit from cached tokens when reported
+    prefix_hit: bool | None
+    if cached is not None:
+        prefix_hit = cached > 0
+    else:
+        prefix_hit = None
+
+    return {
+        "cached_prompt_tokens": cached,
+        "prompt_eval_ms": prompt_eval_ms,
+        "decode_ms": decode_ms_val,
+        "prompt_tokens_per_second": prompt_tps,
+        "generation_tokens_per_second": gen_tps,
+        "prefix_cache_hit": prefix_hit,
+    }
 
 
 # ── JSON repair ────────────────────────────────────────────────────────────────
@@ -392,6 +507,9 @@ class OpenAICompatibleReader:
 
         effective_model = self.model
         effective_provider = ""
+        # Phase 5: KV/prefix-cache metrics (all None = "not reported by backend")
+        cache_metrics: dict[str, Any] = {}
+
         if cached:
             cache_hit = True
             resp_data = cached["response"]
@@ -405,6 +523,8 @@ class OpenAICompatibleReader:
             latency_ms = local_lookup_latency_ms
             effective_model = resp_data.get("effective_model", self.model)
             effective_provider = resp_data.get("effective_provider", "")
+            # Restore persisted cache metrics when available.
+            cache_metrics = resp_data.get("cache_metrics") or {}
         else:
             # Ensure httpx is importable (raises a helpful error otherwise).
             self._get_httpx()
@@ -437,6 +557,9 @@ class OpenAICompatibleReader:
                 usage = data.get("usage", {})
                 prompt_tokens = usage.get("prompt_tokens", 0)
                 completion_tokens = usage.get("completion_tokens", 0)
+                # Phase 5: extract KV-cache and timing fields from the usage object.
+                # Values are None when the backend does not report them.
+                cache_metrics = _extract_cache_metrics(usage)
                 # The gateway echoes the model it actually served; a mismatch with
                 # the requested model means a fallback/switch occurred.
                 effective_model = data.get("model", self.model) or self.model
@@ -451,6 +574,7 @@ class OpenAICompatibleReader:
                     cache_hit=False,
                     upstream_latency_ms=upstream_latency_ms,
                     local_lookup_latency_ms=cache_hit_latency_ms,
+                    prompt_prefix_hash=PROMPT_PREFIX_HASH,
                 )
             upstream_latency_ms = (time.perf_counter() - t_upstream) * 1000
             local_lookup_latency_ms = cache_hit_latency_ms
@@ -465,6 +589,7 @@ class OpenAICompatibleReader:
                         "latency_ms": upstream_latency_ms,
                         "effective_model": effective_model,
                         "effective_provider": effective_provider,
+                        "cache_metrics": cache_metrics,
                     },
                 )
 
@@ -490,6 +615,14 @@ class OpenAICompatibleReader:
             cache_hit=cache_hit,
             upstream_latency_ms=upstream_latency_ms,
             local_lookup_latency_ms=local_lookup_latency_ms,
+            # Phase 5 fields
+            prefix_cache_hit=cache_metrics.get("prefix_cache_hit"),
+            cached_prompt_tokens=cache_metrics.get("cached_prompt_tokens"),
+            prompt_eval_ms=cache_metrics.get("prompt_eval_ms"),
+            decode_ms=cache_metrics.get("decode_ms"),
+            prompt_tokens_per_second=cache_metrics.get("prompt_tokens_per_second"),
+            generation_tokens_per_second=cache_metrics.get("generation_tokens_per_second"),
+            prompt_prefix_hash=PROMPT_PREFIX_HASH,
         )
 
     def __repr__(self) -> str:

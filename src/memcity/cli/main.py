@@ -25,6 +25,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from memcity.utils.helpers import tokenize
+
 app = typer.Typer(
     name="memcity",
     help="Memory City Benchmark — evaluate long-term AI memory architectures.",
@@ -42,6 +44,24 @@ app.add_typer(datasets_app, name="datasets")
 app.add_typer(benchmark_app, name="benchmark")
 app.add_typer(report_app, name="report")
 app.add_typer(index_app, name="index")
+
+
+def _answer_coverage(evidence: list[dict], gold_answer: str) -> tuple[int, int]:
+    """Count how many gold-answer tokens survive in the (compressed) evidence.
+
+    Returns ``(covered, total)`` distinct gold tokens. This is a cheap proxy for
+    whether compression preserved the answer span: a drop in coverage warns that
+    compression is discarding answer-bearing text, which would cap end-to-end
+    accuracy no matter how good the reader is. Empty gold answers count as 0/0.
+    """
+    gold_tokens = set(tokenize(gold_answer))
+    if not gold_tokens:
+        return 0, 0
+    evidence_tokens: set[str] = set()
+    for ep in evidence:
+        evidence_tokens.update(tokenize(ep.get("text", "")))
+    covered = len(gold_tokens & evidence_tokens)
+    return covered, len(gold_tokens)
 
 
 # ── doctor ───────────────────────────────────────────────────────────────────
@@ -252,8 +272,13 @@ def benchmark_retrieval(
     limit: int | None = typer.Option(None, "--limit"),
     output_dir: str = typer.Option("runs", "--output"),
     data_dir: str = typer.Option("data", "--data-dir"),
+    config: str | None = typer.Option(None, "--config", "-c"),
+    context_mode: str | None = typer.Option(
+        None, "--context-mode", help="Contextual indexing: raw|deterministic|llm (Phase 4)."
+    ),
 ) -> None:
     """Run retrieval benchmark across methods."""
+    from memcity.config.schemas import MemCityConfig
     from memcity.datasets.loader import load_dataset
     from memcity.evaluation.runner import RetrievalBenchmarkRunner
     from memcity.reporting.tables import (
@@ -263,6 +288,10 @@ def benchmark_retrieval(
         print_retrieval_table,
     )
     from memcity.retrieval.registry import get_retriever_factory
+
+    cfg = MemCityConfig.from_yaml(config) if config else MemCityConfig()
+    if context_mode:
+        cfg.contextual_index.mode = context_mode  # type: ignore[assignment]
 
     seed_val = int(seeds.split(",")[0])
     ds, samples = load_dataset(dataset, data_dir, seed=seed_val, limit=limit)
@@ -287,6 +316,7 @@ def benchmark_retrieval(
             result = runner.run(
                 retriever_factory=factory,
                 samples=samples,
+                config=cfg,
                 dataset_name=dataset,
                 source_hash=source_hash,
             )
@@ -411,6 +441,22 @@ def benchmark_e2e(
         ),
     ),
     context_token_budget: int = typer.Option(4096, "--context-token-budget"),
+    context_mode: str = typer.Option(
+        "raw", "--context-mode", help="Contextual indexing: raw|deterministic|llm (Phase 4)."
+    ),
+    compress_evidence: bool = typer.Option(
+        False, "--compress-evidence/--no-compress-evidence",
+        help=(
+            "Deterministically compress each retrieved passage before the reader "
+            "reads it (Phase 7): keep only sentences with query overlap, entities, "
+            "numbers/dates, or negations. Preserves citation ids. Records the "
+            "token/latency saving vs. accuracy trade-off in metrics.json."
+        ),
+    ),
+    compress_max_sentences: int = typer.Option(
+        3, "--compress-max-sentences",
+        help="Max sentences kept per passage when --compress-evidence is on.",
+    ),
     top_k: int = typer.Option(5, "--top-k"),
     limit: int | None = typer.Option(None, "--limit"),
     seed: int = typer.Option(42, "--seed"),
@@ -424,10 +470,15 @@ def benchmark_e2e(
     retrieval benchmark. The oracle also looks up evidence from the correct
     scope so cross-scope contamination is zero by construction.
     """
-    from memcity.datasets.corpus import build_scope_corpus, group_samples_by_scope
+    from memcity.datasets.corpus import (
+        apply_contextual_index,
+        build_scope_corpus,
+        group_samples_by_scope,
+    )
     from memcity.datasets.loader import load_dataset
     from memcity.evaluation.e2e_metrics import compute_e2e_metrics
     from memcity.instrumentation.resources import collect_environment, get_vram_mb
+    from memcity.readers.compression import EvidenceCompressor
     from memcity.readers.reader import (
         ENV_BASE_URL,
         ENV_MODEL,
@@ -520,9 +571,26 @@ def benchmark_e2e(
         console.print(f"[red]Unknown reader provider: {reader_provider}[/red]")
         raise typer.Exit(1)
 
+    # Phase 7: optional deterministic evidence compressor. Applied to the
+    # retrieved evidence just before the reader sees it; never touches retrieval.
+    compressor = None
+    if compress_evidence:
+        compressor = EvidenceCompressor(
+            max_sentences_per_passage=compress_max_sentences,
+        )
+        console.print(
+            f"[dim]Evidence compression: ON (max {compress_max_sentences} "
+            f"sentences/passage, keep entities/numbers/negations/query-overlap)[/dim]"
+        )
+
     # Pre-build scope data structures once (shared across retriever variants).
     scope_corpora = build_scope_corpus(samples)
     scoped_samples = group_samples_by_scope(samples)
+    # Phase 4: contextual indexing feeds only the index; RetrievedItem.text and the
+    # reader's evidence stay raw, so citations are unaffected.
+    if context_mode != "raw":
+        for _corpus in scope_corpora.values():
+            apply_contextual_index(_corpus, mode=context_mode)  # type: ignore[arg-type]
     # Flat lookup for oracle evidence (scoped: episode id → corpus item per scope).
     scope_corpus_maps: dict[str, dict[str, dict]] = {
         scope_id: {c["id"]: c for c in corpus}
@@ -542,6 +610,12 @@ def benchmark_e2e(
         retriever_factory = get_retriever_factory(method)
         reader_results: list[dict] = []
         vram_samples_list: list[float] = []
+        # Phase 7 compression accounting for this method.
+        comp_tokens_before = 0
+        comp_tokens_after = 0
+        comp_passages = 0
+        comp_answer_covered = 0
+        comp_answer_total = 0
 
         try:
             # Build one scope-isolated index per scope (mirror of retrieval runner).
@@ -575,19 +649,41 @@ def benchmark_e2e(
                 if use_oracle:
                     ev_ids = sample.evidence_episode_ids
                     oracle_ev = [scope_corpus_map[e] for e in ev_ids if e in scope_corpus_map]
+                    reader_evidence = oracle_ev or evidence
+                    if compressor is not None:
+                        reader_evidence, cstats = compressor.compress_evidence(
+                            reader_evidence, sample.query
+                        )
+                        comp_tokens_before += cstats.tokens_before
+                        comp_tokens_after += cstats.tokens_after
+                        comp_passages += cstats.passages
+                        covered, total = _answer_coverage(reader_evidence, sample.answer)
+                        comp_answer_covered += covered
+                        comp_answer_total += total
                     rr = reader.answer(
                         sample_id=sample.sample_id,
                         query=sample.query,
-                        evidence=oracle_ev or evidence,
+                        evidence=reader_evidence,
                         retriever_name=method,
                         ground_truth_answer=sample.answer,
                         evidence_ids=ev_ids,
                     )
                 else:
+                    reader_evidence = evidence
+                    if compressor is not None:
+                        reader_evidence, cstats = compressor.compress_evidence(
+                            reader_evidence, sample.query
+                        )
+                        comp_tokens_before += cstats.tokens_before
+                        comp_tokens_after += cstats.tokens_after
+                        comp_passages += cstats.passages
+                        covered, total = _answer_coverage(reader_evidence, sample.answer)
+                        comp_answer_covered += covered
+                        comp_answer_total += total
                     rr = reader.answer(
                         sample_id=sample.sample_id,
                         query=sample.query,
-                        evidence=evidence,
+                        evidence=reader_evidence,
                         retriever_name=method,
                     )
                 reader_results.append(rr.model_dump())
@@ -610,6 +706,29 @@ def benchmark_e2e(
         metrics["context_token_budget"] = context_token_budget
         metrics["top_k"] = top_k
         metrics["peak_vram_mb"] = max(vram_samples_list) if vram_samples_list else 0.0
+
+        # Phase 7: evidence-compression accounting. Recorded only when compression
+        # ran, so an uncompressed run's metrics.json is unchanged. compression_ratio
+        # is the fraction of evidence tokens removed; answer_token_coverage is the
+        # fraction of gold-answer tokens still present after compression (a proxy
+        # for whether compression preserved the answer span).
+        metrics["compression_enabled"] = bool(compressor is not None)
+        if compressor is not None:
+            metrics["compression_passages"] = float(comp_passages)
+            metrics["compression_tokens_before"] = float(comp_tokens_before)
+            metrics["compression_tokens_after"] = float(comp_tokens_after)
+            metrics["compression_ratio"] = (
+                1.0 - (comp_tokens_after / comp_tokens_before)
+                if comp_tokens_before else 0.0
+            )
+            metrics["compression_answer_token_coverage"] = (
+                comp_answer_covered / comp_answer_total if comp_answer_total else 0.0
+            )
+            console.print(
+                f"[dim]Compression: {comp_tokens_before}→{comp_tokens_after} tokens "
+                f"({metrics['compression_ratio']:.1%} removed), answer coverage "
+                f"{metrics['compression_answer_token_coverage']:.1%}[/dim]"
+            )
 
         # Reproducibility auditing: record requested vs. effective model/provider
         # and surface any gateway fallback as a run-level warning.

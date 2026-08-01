@@ -59,6 +59,51 @@ class CoordinatorDecision:
         }
 
 
+# Temporal query intent (Phase 3). A temporal query is parsed into a *constraint*
+# on event time, not merely a "sort oldest/newest" hint:
+#   "currently" / "now"           → CURRENT  (valid_to is None)
+#   "originally" / "first"        → ORIGINAL (earliest valid fact)
+#   "before <ref>"                → BEFORE   (valid at < ref)
+#   "after <ref>"                 → AFTER    (valid at > ref)
+# ``kind == NONE`` means the query carries no resolvable temporal constraint.
+_CURRENT_RE = re.compile(r"\b(current(?:ly)?|now|today|latest|these days)\b", re.I)
+_ORIGINAL_RE = re.compile(r"\b(originally|first|initially|at first|used to|before)\b", re.I)
+_BEFORE_RE = re.compile(r"\bbefore\b", re.I)
+_AFTER_RE = re.compile(r"\bafter\b", re.I)
+
+
+@dataclass
+class TemporalConstraint:
+    kind: str = "none"  # none | current | original | before | after
+    # Reference event-time boundary for before/after when one can be resolved
+    # from the query (e.g. an explicit year). None when unresolved — the retriever
+    # then relies on fact ordering rather than an absolute timestamp.
+    reference: float | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.kind != "none"
+
+
+def parse_temporal_constraint(query: str) -> TemporalConstraint:
+    """Parse a query into an event-time constraint (deterministic, no LLM).
+
+    Kept intentionally conservative: only clear cues produce a constraint so a
+    non-temporal query is never forced onto the temporal path.
+    """
+    q = query.strip()
+    # "current" wins over "before/original" when both appear ("current vs original").
+    if _CURRENT_RE.search(q) and not _BEFORE_RE.search(q):
+        return TemporalConstraint(kind="current")
+    if _BEFORE_RE.search(q):
+        return TemporalConstraint(kind="before")
+    if _AFTER_RE.search(q):
+        return TemporalConstraint(kind="after")
+    if _ORIGINAL_RE.search(q):
+        return TemporalConstraint(kind="original")
+    return TemporalConstraint(kind="none")
+
+
 class Coordinator:
     """Rule-based query router.
 

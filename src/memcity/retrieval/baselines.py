@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from memcity.evaluation.metrics import compute_rrf
 from memcity.retrieval.protocol import IndexStats, RetrievalResult, RetrievalTrace, RetrievedItem
-from memcity.utils.helpers import normalize_text, tokenize
-
+from memcity.utils.helpers import tokenize
 
 # ── Corpus item helpers ──────────────────────────────────────────────────────
 
@@ -22,6 +20,14 @@ def _item_text(item: dict) -> str:
         if v:
             parts.append(v)
     return " ".join(parts)
+
+
+def _index_text(item: dict) -> str:
+    """Text fed to the index. Prefers the contextual ``indexed_text`` (Phase 4)
+    when present, else falls back to the raw episode text. Retrieved evidence
+    always uses ``_item_text`` (raw), so a context prefix never leaks into
+    results or citations."""
+    return item.get("indexed_text") or _item_text(item)
 
 
 def _item_ts(item: dict) -> float:
@@ -136,7 +142,7 @@ class BM25Retriever:
         from rank_bm25 import BM25Okapi
         t0 = time.perf_counter()
         self._corpus = list(corpus)
-        tokenized = [tokenize(_item_text(it)) for it in self._corpus]
+        tokenized = [tokenize(_index_text(it)) for it in self._corpus]
         self._bm25 = BM25Okapi(tokenized, k1=self._k1, b=self._b)
         return IndexStats(
             method=self.name,
@@ -206,7 +212,7 @@ class VectorRetriever:
     def build(self, corpus: list[dict], config: Any = None) -> IndexStats:
         t0 = time.perf_counter()
         self._corpus = list(corpus)
-        texts = [_item_text(it) for it in self._corpus]
+        texts = [_index_text(it) for it in self._corpus]
         self._matrix = self._embed(texts)
         return IndexStats(
             method=self.name,

@@ -34,6 +34,9 @@ class RetrievalTrace(BaseModel):
     vector_candidates: list[str] = Field(default_factory=list)
     graph_candidates: list[str] = Field(default_factory=list)
     community_candidates: list[str] = Field(default_factory=list)
+    # Hierarchical summary-tree routing (Phase 6): raw episodes surfaced by
+    # descending the summary tree for a global/overview query.
+    tree_candidates: list[str] = Field(default_factory=list)
     # Unranked union of every candidate the pipeline saw (answers "is the
     # evidence anywhere in the pool?" — candidate_pool_recall).
     candidate_pool: list[str] = Field(default_factory=list)
